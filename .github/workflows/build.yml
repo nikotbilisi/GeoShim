@@ -5,67 +5,34 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
-      - name: Patch GeoShim to pure locationd-only (Safe for iOS 18)
+      - name: Patch GeoShim to locationd-only
         run: |
           python3 - << 'PY'
           import re, plistlib
-
           with open("GeoShim.plist", "wb") as f:
               plistlib.dump({"Filter": {"Executables": ["locationd"]}}, f)
-
-          with open("Tweak.x", "r") as f:
-              tx = f.read()
+          tx = open("Tweak.x").read()
           tx = re.sub(r'#\s*(?:import|include)\s*[<"]libSandy\.h[>"]', '', tx)
-          with open("Tweak.x", "w") as f:
-              f.write(tx)
-
+          open("Tweak.x", "w").write(tx)
           with open("GSConfig.m", "a") as f:
               f.write("\nint libSandy_applyProfile(const char *p) { (void)p; return 0; }\n")
-
-          with open("Makefile", "r") as f:
-              mk = f.read()
-          mk = re.sub(
-              r'^(\s*\w+_LIBRARIES\b.*)$',
-              lambda m: re.sub(r'\bsandy\b', '', m.group(1)),
-              mk,
-              flags=re.M,
-          )
-          with open("Makefile", "w") as f:
-              f.write(mk)
+          mk = open("Makefile").read()
+          mk = re.sub(r'^(\s*\w+_LIBRARIES\b.*)$', lambda m: re.sub(r'\bsandy\b', '', m.group(1)), mk, flags=re.M)
+          open("Makefile", "w").write(mk)
           PY
 
-      - name: Setup Linux Toolchain & RootHide Theos
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Setup RootHide Theos (macOS + Xcode)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential fakeroot dpkg git perl curl xz-utils zstd bzip2 python3 libtinfo5 libncurses5 libxml2 libz3-4 pkg-config libplist-dev libssl-dev
-          git clone --depth 1 https://github.com/ProcursusTeam/ldid.git /tmp/ldid
-          make -C /tmp/ldid
-          sudo install -m 0755 /tmp/ldid/ldid /usr/local/bin/ldid
-          export THEOS="$HOME/theos"
-          git clone --recursive https://github.com/roothide/theos.git "$THEOS"
-          TC_URL=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/kabiroberai/swift-toolchain-linux/releases/latest | grep -o 'https://[^"]*ubuntu22\.04\.tar\.xz' | head -n 1 || true)
-          if [ -z "$TC_URL" ]; then
-            TC_URL="https://github.com/kabiroberai/swift-toolchain-linux/releases/download/v2.3.0/swift-5.8-ubuntu22.04.tar.xz"
-          fi
-          curl -fL "$TC_URL" -o /tmp/tc.tar.xz
-          mkdir -p /tmp/tc "$THEOS/toolchain/linux/iphone" "$THEOS/sdks"
-          tar -xf /tmp/tc.tar.xz -C /tmp/tc
-          if [ -d /tmp/tc/linux/iphone ]; then
-            cp -a /tmp/tc/* "$THEOS/toolchain/"
-          else
-            CLANG_PATH=$(find /tmp/tc \( -type f -o -type l \) -path "*/bin/clang" | head -n 1)
-            TC_ROOT=$(dirname "$(dirname "$CLANG_PATH")")
-            cp -a "$TC_ROOT"/. "$THEOS/toolchain/linux/iphone/"
-          fi
-          cp -f /tmp/ldid/ldid "$THEOS/toolchain/linux/iphone/bin/ldid"
+          brew install ldid dpkg xz make
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+          git clone --recursive https://github.com/roothide/theos.git "$HOME/theos"
+          mkdir -p "$HOME/theos/sdks"
           curl -fL https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.xz -o /tmp/sdk.tar.xz
-          tar -xf /tmp/sdk.tar.xz -C "$THEOS/sdks"
+          tar -xf /tmp/sdk.tar.xz -C "$HOME/theos/sdks"
 
       - name: Stage Prebuilt RootHide libSandy & AltList
         run: |
@@ -73,30 +40,26 @@ jobs:
           mkdir -p /tmp/rhstage "$THEOS/lib/iphone/roothide" "$THEOS/vendor/lib/iphone/roothide" "$THEOS/include"
           python3 - << 'PY'
           import urllib.request, urllib.parse, bz2, gzip, subprocess
-
           base = "https://roothide.github.io/"
           raw = None
           for name, dec in [("Packages", lambda b: b), ("Packages.bz2", bz2.decompress), ("Packages.gz", gzip.decompress)]:
               try:
                   req = urllib.request.Request(base + name, headers={"User-Agent": "Sileo/2.5"})
                   with urllib.request.urlopen(req) as r:
-                      raw = dec(r.read()).decode("utf-8", "ignore")
-                      break
+                      raw = dec(r.read()).decode("utf-8", "ignore"); break
               except Exception:
                   pass
-
-          assert raw, "Failed to fetch Packages from roothide.github.io"
+          assert raw, "Failed to fetch Packages"
           for target in ["com.opa334.libsandy", "com.opa334.altlist"]:
               matches = []
               for stanza in raw.split("\n\n"):
                   fields = {}
                   for line in stanza.splitlines():
                       if ":" in line and not line[0].isspace():
-                          k, v = line.split(":", 1)
-                          fields[k.strip()] = v.strip()
+                          k, v = line.split(":", 1); fields[k.strip()] = v.strip()
                   if fields.get("Package") == target and "Filename" in fields:
                       matches.append((fields.get("Architecture") == "iphoneos-arm64e", fields["Filename"]))
-              assert matches, f"Package {target} not found"
+              assert matches, f"{target} not found"
               matches.sort()
               rel = urllib.parse.quote(matches[-1][1].lstrip("./"), safe="/+-._~")
               out = f"/tmp/{target}.deb"
@@ -114,14 +77,14 @@ jobs:
           git clone --depth 1 https://github.com/roothide/libSandy.git /tmp/libSandy
           cp -f /tmp/libSandy/libSandy.h "$THEOS/include/"
           git clone --depth 1 https://github.com/opa334/AltList.git /tmp/AltList
-          mkdir -p "$THEOS/lib/iphone/roothide/AltList.framework/Headers" "$THEOS/vendor/lib/iphone/roothide/AltList.framework/Headers" "$THEOS/include/AltList"
-          find /tmp/AltList -name "*.h" -exec cp -f {} "$THEOS/lib/iphone/roothide/AltList.framework/Headers/" \; -exec cp -f {} "$THEOS/vendor/lib/iphone/roothide/AltList.framework/Headers/" \; -exec cp -f {} "$THEOS/include/AltList/" \;
+          mkdir -p "$THEOS/include/AltList" "$THEOS/lib/iphone/roothide/AltList.framework/Headers" "$THEOS/vendor/lib/iphone/roothide/AltList.framework/Headers"
+          find /tmp/AltList -name "*.h" -exec cp -f {} "$THEOS/include/AltList/" \; -exec cp -f {} "$THEOS/lib/iphone/roothide/AltList.framework/Headers/" \; -exec cp -f {} "$THEOS/vendor/lib/iphone/roothide/AltList.framework/Headers/" \;
 
       - name: Build .deb
         run: |
           export THEOS="$HOME/theos"
-          export PATH="/usr/local/bin:$THEOS/bin:$PATH"
           make package FINALPACKAGE=1 ARCHS=arm64e
+          find .theos/obj -type f \( -name "GeoShim.dylib" -o -name "geoshim" \) -exec otool -hv {} \;
 
       - name: Save .deb file
         uses: actions/upload-artifact@v4
