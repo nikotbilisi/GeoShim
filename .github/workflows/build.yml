@@ -1,28 +1,32 @@
 name: Build GeoShim RootHide
+
 on:
   workflow_dispatch:
   push:
 
+concurrency:
+  group: geoshim-build
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
-      - name: Patch GeoShim to locationd-only
+      - name: Patch filter to locationd-only
         run: |
           python3 - << 'PY'
-          import re, plistlib
+          import plistlib
           with open("GeoShim.plist", "wb") as f:
               plistlib.dump({"Filter": {"Executables": ["locationd"]}}, f)
-          tx = open("Tweak.x").read()
-          tx = re.sub(r'#\s*(?:import|include)\s*[<"]libSandy\.h[>"]', '', tx)
-          open("Tweak.x", "w").write(tx)
-          with open("GSConfig.m", "a") as f:
-              f.write("\nint libSandy_applyProfile(const char *p) { (void)p; return 0; }\n")
-          mk = open("Makefile").read()
-          mk = re.sub(r'^(\s*\w+_LIBRARIES\b.*)$', lambda m: re.sub(r'\bsandy\b', '', m.group(1)), mk, flags=re.M)
-          open("Makefile", "w").write(mk)
+          assert plistlib.load(open("GeoShim.plist", "rb")) == {"Filter": {"Executables": ["locationd"]}}
+          print("filter ok")
           PY
 
       - name: Setup RootHide Theos (macOS + Xcode)
@@ -33,6 +37,7 @@ jobs:
           mkdir -p "$HOME/theos/sdks"
           curl -fL https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.xz -o /tmp/sdk.tar.xz
           tar -xf /tmp/sdk.tar.xz -C "$HOME/theos/sdks"
+          ls "$HOME/theos/sdks"
 
       - name: Stage Prebuilt RootHide libSandy & AltList
         run: |
@@ -84,10 +89,35 @@ jobs:
         run: |
           export THEOS="$HOME/theos"
           make package FINALPACKAGE=1 ARCHS=arm64e
-          find .theos/obj -type f \( -name "GeoShim.dylib" -o -name "geoshim" \) -exec otool -hv {} \;
+
+      - name: Verify arm64e ABI (fail on old ABI)
+        run: |
+          python3 - << 'PY'
+          import glob, os, struct, sys
+          cands = []
+          for pat in ("**/GeoShim.dylib", "**/geoshim", "**/GeoShimPrefs.bundle/GeoShimPrefs"):
+              cands += glob.glob(os.path.join(".theos/obj", pat), recursive=True)
+          files = [p for p in cands if os.path.isfile(p)]
+          if not files:
+              sys.exit("no built binaries found")
+          bad = []
+          for p in files:
+              magic, cputype, subtype = struct.unpack("<III", open(p, "rb").read(12))
+              print(f"{p}: magic=0x{magic:08x} cputype=0x{cputype:08x} cpusubtype=0x{subtype:08x}")
+              if cputype != 0x0100000C or not (subtype & 0x80000000):
+                  bad.append(p)
+          if bad:
+              sys.exit("old arm64e ABI (will not run on iOS 14+): " + ", ".join(bad))
+          print("OK: arm64e ptrauth ABI")
+          PY
+          DEB=$(ls packages/*.deb | head -n 1)
+          echo "deb: $DEB"
+          dpkg-deb -f "$DEB" Package Version Architecture
+          [ "$(dpkg-deb -f "$DEB" Architecture)" = "iphoneos-arm64e" ] || { echo "bad package arch"; exit 1; }
 
       - name: Save .deb file
         uses: actions/upload-artifact@v4
         with:
-          name: geoshim-roothide-deb
+          name: geoshim-deb-${{ matrix.os }}
           path: packages/*.deb
+          if-no-files-found: error
