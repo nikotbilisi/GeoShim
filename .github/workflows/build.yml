@@ -19,13 +19,12 @@ jobs:
 
           with open("Tweak.x", "r") as f:
               tx = f.read()
-          tx = re.sub(
-              r'#\s*(?:import|include)\s*[<"]libSandy\.h[>"]',
-              'static inline int libSandy_applyProfile(const char *p) { (void)p; return 0; }',
-              tx,
-          )
+          tx = re.sub(r'#\s*(?:import|include)\s*[<"]libSandy\.h[>"]', '', tx)
           with open("Tweak.x", "w") as f:
               f.write(tx)
+
+          with open("GSConfig.m", "a") as f:
+              f.write("\nint libSandy_applyProfile(const char *p) { (void)p; return 0; }\n")
 
           with open("Makefile", "r") as f:
               mk = f.read()
@@ -68,7 +67,7 @@ jobs:
           curl -fL https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.xz -o /tmp/sdk.tar.xz
           tar -xf /tmp/sdk.tar.xz -C "$THEOS/sdks"
 
-      - name: Stage Prebuilt RootHide AltList
+      - name: Stage Prebuilt RootHide libSandy & AltList
         run: |
           export THEOS="$HOME/theos"
           mkdir -p /tmp/rhstage "$THEOS/lib/iphone/roothide" "$THEOS/vendor/lib/iphone/roothide" "$THEOS/include"
@@ -87,27 +86,33 @@ jobs:
                   pass
 
           assert raw, "Failed to fetch Packages from roothide.github.io"
-          matches = []
-          for stanza in raw.split("\n\n"):
-              fields = {}
-              for line in stanza.splitlines():
-                  if ":" in line and not line[0].isspace():
-                      k, v = line.split(":", 1)
-                      fields[k.strip()] = v.strip()
-              if fields.get("Package") == "com.opa334.altlist" and "Filename" in fields:
-                  matches.append((fields.get("Architecture") == "iphoneos-arm64e", fields["Filename"]))
-          assert matches, "Package com.opa334.altlist not found"
-          matches.sort()
-          rel = urllib.parse.quote(matches[-1][1].lstrip("./"), safe="/+-._~")
-          out = "/tmp/com.opa334.altlist.deb"
-          req = urllib.request.Request(base + rel, headers={"User-Agent": "Sileo/2.5"})
-          with urllib.request.urlopen(req) as r, open(out, "wb") as f:
-              f.write(r.read())
-          subprocess.run(["dpkg-deb", "-x", out, "/tmp/rhstage"], check=True)
+          for target in ["com.opa334.libsandy", "com.opa334.altlist"]:
+              matches = []
+              for stanza in raw.split("\n\n"):
+                  fields = {}
+                  for line in stanza.splitlines():
+                      if ":" in line and not line[0].isspace():
+                          k, v = line.split(":", 1)
+                          fields[k.strip()] = v.strip()
+                  if fields.get("Package") == target and "Filename" in fields:
+                      matches.append((fields.get("Architecture") == "iphoneos-arm64e", fields["Filename"]))
+              assert matches, f"Package {target} not found"
+              matches.sort()
+              rel = urllib.parse.quote(matches[-1][1].lstrip("./"), safe="/+-._~")
+              out = f"/tmp/{target}.deb"
+              req = urllib.request.Request(base + rel, headers={"User-Agent": "Sileo/2.5"})
+              with urllib.request.urlopen(req) as r, open(out, "wb") as f:
+                  f.write(r.read())
+              subprocess.run(["dpkg-deb", "-x", out, "/tmp/rhstage"], check=True)
           PY
+          SANDY_DYLIB=$(find /tmp/rhstage -iname "libsandy.dylib" | head -n 1)
           ALTLIST_FW=$(find /tmp/rhstage -type d -name "AltList.framework" | head -n 1)
+          cp -a "$SANDY_DYLIB" "$THEOS/lib/iphone/roothide/libsandy.dylib"
+          cp -a "$SANDY_DYLIB" "$THEOS/vendor/lib/iphone/roothide/libsandy.dylib"
           cp -a "$ALTLIST_FW" "$THEOS/lib/iphone/roothide/"
           cp -a "$ALTLIST_FW" "$THEOS/vendor/lib/iphone/roothide/"
+          git clone --depth 1 https://github.com/roothide/libSandy.git /tmp/libSandy
+          cp -f /tmp/libSandy/libSandy.h "$THEOS/include/"
           git clone --depth 1 https://github.com/opa334/AltList.git /tmp/AltList
           mkdir -p "$THEOS/lib/iphone/roothide/AltList.framework/Headers" "$THEOS/vendor/lib/iphone/roothide/AltList.framework/Headers" "$THEOS/include/AltList"
           find /tmp/AltList -name "*.h" -exec cp -f {} "$THEOS/lib/iphone/roothide/AltList.framework/Headers/" \; -exec cp -f {} "$THEOS/vendor/lib/iphone/roothide/AltList.framework/Headers/" \; -exec cp -f {} "$THEOS/include/AltList/" \;
