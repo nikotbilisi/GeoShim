@@ -9,24 +9,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Patch Filter to locationd-only (Never touch SpringBoard/backboardd)
+      - name: Patch GeoShim to pure locationd-only (Safe for iOS 18)
         run: |
-          cat > GeoShim.plist << 'PLIST'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>Filter</key>
-            <dict>
-              <key>Executables</key>
-              <array>
-                <string>locationd</string>
-              </array>
-            </dict>
-          </dict>
-          </plist>
-          PLIST
-          python3 -c 'import plistlib; assert plistlib.load(open("GeoShim.plist","rb")) == {"Filter": {"Executables": ["locationd"]}}'
+          python3 - << 'PY'
+          import re, plistlib
+
+          with open("GeoShim.plist", "wb") as f:
+              plistlib.dump({"Filter": {"Executables": ["locationd"]}}, f)
+
+          with open("Tweak.x", "r") as f:
+              tx = f.read()
+          tx = re.sub(
+              r'#\s*(?:import|include)\s*[<"]libSandy\.h[>"]',
+              'static inline int libSandy_applyProfile(const char *p) { (void)p; return 0; }',
+              tx,
+          )
+          with open("Tweak.x", "w") as f:
+              f.write(tx)
+
+          with open("Makefile", "r") as f:
+              mk = f.read()
+          mk = re.sub(
+              r'^(\s*\w+_LIBRARIES\b.*)$',
+              lambda m: re.sub(r'\bsandy\b', '', m.group(1)),
+              mk,
+              flags=re.M,
+          )
+          with open("Makefile", "w") as f:
+              f.write(mk)
+          PY
 
       - name: Setup Linux Toolchain & RootHide Theos
         env:
@@ -57,7 +68,7 @@ jobs:
           curl -fL https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.xz -o /tmp/sdk.tar.xz
           tar -xf /tmp/sdk.tar.xz -C "$THEOS/sdks"
 
-      - name: Stage Prebuilt RootHide libSandy & AltList
+      - name: Stage Prebuilt RootHide AltList
         run: |
           export THEOS="$HOME/theos"
           mkdir -p /tmp/rhstage "$THEOS/lib/iphone/roothide" "$THEOS/vendor/lib/iphone/roothide" "$THEOS/include"
@@ -76,33 +87,27 @@ jobs:
                   pass
 
           assert raw, "Failed to fetch Packages from roothide.github.io"
-          for target in ["com.opa334.libsandy", "com.opa334.altlist"]:
-              matches = []
-              for stanza in raw.split("\n\n"):
-                  fields = {}
-                  for line in stanza.splitlines():
-                      if ":" in line and not line[0].isspace():
-                          k, v = line.split(":", 1)
-                          fields[k.strip()] = v.strip()
-                  if fields.get("Package") == target and "Filename" in fields:
-                      matches.append((fields.get("Architecture") == "iphoneos-arm64e", fields["Filename"]))
-              assert matches, f"Package {target} not found"
-              matches.sort()
-              rel = urllib.parse.quote(matches[-1][1].lstrip("./"), safe="/+-._~")
-              out = f"/tmp/{target}.deb"
-              req = urllib.request.Request(base + rel, headers={"User-Agent": "Sileo/2.5"})
-              with urllib.request.urlopen(req) as r, open(out, "wb") as f:
-                  f.write(r.read())
-              subprocess.run(["dpkg-deb", "-x", out, "/tmp/rhstage"], check=True)
+          matches = []
+          for stanza in raw.split("\n\n"):
+              fields = {}
+              for line in stanza.splitlines():
+                  if ":" in line and not line[0].isspace():
+                      k, v = line.split(":", 1)
+                      fields[k.strip()] = v.strip()
+              if fields.get("Package") == "com.opa334.altlist" and "Filename" in fields:
+                  matches.append((fields.get("Architecture") == "iphoneos-arm64e", fields["Filename"]))
+          assert matches, "Package com.opa334.altlist not found"
+          matches.sort()
+          rel = urllib.parse.quote(matches[-1][1].lstrip("./"), safe="/+-._~")
+          out = "/tmp/com.opa334.altlist.deb"
+          req = urllib.request.Request(base + rel, headers={"User-Agent": "Sileo/2.5"})
+          with urllib.request.urlopen(req) as r, open(out, "wb") as f:
+              f.write(r.read())
+          subprocess.run(["dpkg-deb", "-x", out, "/tmp/rhstage"], check=True)
           PY
-          SANDY_DYLIB=$(find /tmp/rhstage -iname "libsandy.dylib" | head -n 1)
           ALTLIST_FW=$(find /tmp/rhstage -type d -name "AltList.framework" | head -n 1)
-          cp -a "$SANDY_DYLIB" "$THEOS/lib/iphone/roothide/libsandy.dylib"
-          cp -a "$SANDY_DYLIB" "$THEOS/vendor/lib/iphone/roothide/libsandy.dylib"
           cp -a "$ALTLIST_FW" "$THEOS/lib/iphone/roothide/"
           cp -a "$ALTLIST_FW" "$THEOS/vendor/lib/iphone/roothide/"
-          git clone --depth 1 https://github.com/roothide/libSandy.git /tmp/libSandy
-          cp -f /tmp/libSandy/libSandy.h "$THEOS/include/"
           git clone --depth 1 https://github.com/opa334/AltList.git /tmp/AltList
           mkdir -p "$THEOS/lib/iphone/roothide/AltList.framework/Headers" "$THEOS/vendor/lib/iphone/roothide/AltList.framework/Headers" "$THEOS/include/AltList"
           find /tmp/AltList -name "*.h" -exec cp -f {} "$THEOS/lib/iphone/roothide/AltList.framework/Headers/" \; -exec cp -f {} "$THEOS/vendor/lib/iphone/roothide/AltList.framework/Headers/" \; -exec cp -f {} "$THEOS/include/AltList/" \;
