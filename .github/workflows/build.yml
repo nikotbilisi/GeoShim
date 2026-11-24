@@ -5,23 +5,31 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup RootHide Theos
+      - name: Setup Linux Toolchain & RootHide Theos
         run: |
-          brew install ldid dpkg xz
+          sudo apt-get update
+          sudo apt-get install -y build-essential fakeroot dpkg git perl curl xz-utils libtinfo5 pkg-config libplist-dev libssl-dev
+          git clone --depth 1 https://github.com/ProcursusTeam/ldid.git /tmp/ldid
+          make -C /tmp/ldid
+          sudo install -m 0755 /tmp/ldid/ldid /usr/local/bin/ldid
           export THEOS="$HOME/theos"
           git clone --recursive https://github.com/roothide/theos.git "$THEOS"
-          mkdir -p "$THEOS/sdks"
-          curl -fsSL https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.xz -o sdk.tar.xz
-          tar -xf sdk.tar.xz -C "$THEOS/sdks"
+          curl -fsSL https://github.com/sbingner/llvm-project/releases/latest/download/linux-ios-arm64e-clang-toolchain.tar.lzma -o /tmp/tc.tar.lzma
+          mkdir -p /tmp/tc "$THEOS/toolchain/linux/iphone" "$THEOS/sdks"
+          tar --lzma -xf /tmp/tc.tar.lzma -C /tmp/tc
+          mv /tmp/tc/ios-arm64e-clang-toolchain/* "$THEOS/toolchain/linux/iphone/"
+          cp -f /tmp/ldid/ldid "$THEOS/toolchain/linux/iphone/bin/ldid"
+          curl -fsSL https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.xz -o /tmp/sdk.tar.xz
+          tar -xf /tmp/sdk.tar.xz -C "$THEOS/sdks"
 
       - name: Build .deb
         run: |
           export THEOS="$HOME/theos"
-          export PATH="/opt/homebrew/bin:/usr/local/bin:$THEOS/bin:$PATH"
+          export PATH="/usr/local/bin:$THEOS/bin:$PATH"
           make package FINALPACKAGE=1
 
       - name: Save .deb file
