@@ -9,6 +9,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Patch Filter to locationd-only (Never touch SpringBoard/backboardd)
+        run: |
+          cat > GeoShim.plist << 'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>Filter</key>
+            <dict>
+              <key>Executables</key>
+              <array>
+                <string>locationd</string>
+              </array>
+            </dict>
+          </dict>
+          </plist>
+          PLIST
+          python3 -c 'import plistlib; assert plistlib.load(open("GeoShim.plist","rb")) == {"Filter": {"Executables": ["locationd"]}}'
+
       - name: Setup Linux Toolchain & RootHide Theos
         env:
           GH_TOKEN: ${{ github.token }}
