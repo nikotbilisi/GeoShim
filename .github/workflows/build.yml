@@ -14,7 +14,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential fakeroot dpkg git perl curl xz-utils zstd libtinfo5 libncurses5 libxml2 libz3-4 pkg-config libplist-dev libssl-dev
+          sudo apt-get install -y build-essential fakeroot dpkg git perl curl xz-utils zstd bzip2 python3 libtinfo5 libncurses5 libxml2 libz3-4 pkg-config libplist-dev libssl-dev
           git clone --depth 1 https://github.com/ProcursusTeam/ldid.git /tmp/ldid
           make -C /tmp/ldid
           sudo install -m 0755 /tmp/ldid/ldid /usr/local/bin/ldid
@@ -25,7 +25,7 @@ jobs:
             TC_URL="https://github.com/kabiroberai/swift-toolchain-linux/releases/download/v2.3.0/swift-5.8-ubuntu22.04.tar.xz"
           fi
           curl -fL "$TC_URL" -o /tmp/tc.tar.xz
-          mkdir -p /tmp/tc "$THEOS/toolchain/linux/iphone" "$THEOS/sdks" "$THEOS/lib/iphone/roothide" "$THEOS/include"
+          mkdir -p /tmp/tc "$THEOS/toolchain/linux/iphone" "$THEOS/sdks"
           tar -xf /tmp/tc.tar.xz -C /tmp/tc
           if [ -d /tmp/tc/linux/iphone ]; then
             cp -a /tmp/tc/* "$THEOS/toolchain/"
@@ -38,28 +38,61 @@ jobs:
           curl -fL https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.xz -o /tmp/sdk.tar.xz
           tar -xf /tmp/sdk.tar.xz -C "$THEOS/sdks"
 
-      - name: Stage libSandy & AltList for RootHide
+      - name: Stage Prebuilt RootHide libSandy & AltList
         run: |
           export THEOS="$HOME/theos"
-          export PATH="/usr/local/bin:$THEOS/bin:$PATH"
+          mkdir -p /tmp/rhstage "$THEOS/lib/iphone/roothide" "$THEOS/vendor/lib/iphone/roothide" "$THEOS/include"
+          python3 - << 'PY'
+          import urllib.request, urllib.parse, bz2, gzip, subprocess
+
+          base = "https://roothide.github.io/"
+          raw = None
+          for name, dec in [("Packages", lambda b: b), ("Packages.bz2", bz2.decompress), ("Packages.gz", gzip.decompress)]:
+              try:
+                  req = urllib.request.Request(base + name, headers={"User-Agent": "Sileo/2.5"})
+                  with urllib.request.urlopen(req) as r:
+                      raw = dec(r.read()).decode("utf-8", "ignore")
+                      break
+              except Exception:
+                  pass
+
+          assert raw, "Failed to fetch Packages from roothide.github.io"
+          for target in ["com.opa334.libsandy", "com.opa334.altlist"]:
+              matches = []
+              for stanza in raw.split("\n\n"):
+                  fields = {}
+                  for line in stanza.splitlines():
+                      if ":" in line and not line[0].isspace():
+                          k, v = line.split(":", 1)
+                          fields[k.strip()] = v.strip()
+                  if fields.get("Package") == target and "Filename" in fields:
+                      matches.append((fields.get("Architecture") == "iphoneos-arm64e", fields["Filename"]))
+              assert matches, f"Package {target} not found"
+              matches.sort()
+              rel = urllib.parse.quote(matches[-1][1].lstrip("./"), safe="/+-._~")
+              out = f"/tmp/{target}.deb"
+              req = urllib.request.Request(base + rel, headers={"User-Agent": "Sileo/2.5"})
+              with urllib.request.urlopen(req) as r, open(out, "wb") as f:
+                  f.write(r.read())
+              subprocess.run(["dpkg-deb", "-x", out, "/tmp/rhstage"], check=True)
+          PY
+          SANDY_DYLIB=$(find /tmp/rhstage -iname "libsandy.dylib" | head -n 1)
+          ALTLIST_FW=$(find /tmp/rhstage -type d -name "AltList.framework" | head -n 1)
+          cp -a "$SANDY_DYLIB" "$THEOS/lib/iphone/roothide/libsandy.dylib"
+          cp -a "$SANDY_DYLIB" "$THEOS/vendor/lib/iphone/roothide/libsandy.dylib"
+          cp -a "$ALTLIST_FW" "$THEOS/lib/iphone/roothide/"
+          cp -a "$ALTLIST_FW" "$THEOS/vendor/lib/iphone/roothide/"
           git clone --depth 1 https://github.com/roothide/libSandy.git /tmp/libSandy
-          make -C /tmp/libSandy FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide ONLY_LIBRARY=1
-          SANDY_LIB=$(find /tmp/libSandy/.theos/obj -maxdepth 1 -type f -iname "libsandy.dylib" | head -n 1)
-          cp -a "$SANDY_LIB" "$THEOS/lib/iphone/roothide/libsandy.dylib"
           cp -f /tmp/libSandy/libSandy.h "$THEOS/include/"
-          if [ ! -d "$THEOS/vendor/lib/iphone/roothide/AltList.framework" ]; then
-            git clone --depth 1 https://github.com/opa334/AltList.git /tmp/AltList
-            make -C /tmp/AltList FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide || [ -d /tmp/AltList/.theos/obj/AltList.framework ]
-            cp -a /tmp/AltList/.theos/obj/AltList.framework "$THEOS/lib/iphone/roothide/"
-            mkdir -p "$THEOS/include/AltList"
-            cp -f /tmp/AltList/.theos/obj/AltList.framework/Headers/*.h "$THEOS/include/AltList/" 2>/dev/null || true
-          fi
+          git clone --depth 1 https://github.com/opa334/AltList.git /tmp/AltList
+          mkdir -p "$THEOS/lib/iphone/roothide/AltList.framework/Headers" "$THEOS/vendor/lib/iphone/roothide/AltList.framework/Headers" "$THEOS/include/AltList"
+          find /tmp/AltList -name "*.h" -exec cp -f {} "$THEOS/lib/iphone/roothide/AltList.framework/Headers/" \; -exec cp -f {} "$THEOS/vendor/lib/iphone/roothide/AltList.framework/Headers/" \; -exec cp -f {} "$THEOS/include/AltList/" \;
 
       - name: Build .deb
         run: |
           export THEOS="$HOME/theos"
           export PATH="/usr/local/bin:$THEOS/bin:$PATH"
-          make package FINALPACKAGE=1
+          make package FINALPACKAGE=1 ARCHS=arm64e
 
       - name: Save .deb file
         uses: actions/upload-artifact@v4
