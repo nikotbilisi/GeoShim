@@ -72,7 +72,7 @@ jobs:
       - name: Build .deb
         run: |
           export THEOS="$HOME/theos"
-          make package FINALPACKAGE=1 ARCHS=arm64e
+          make package ARCHS=arm64e
 
       - name: Verify arm64e ABI and package contents
         run: |
