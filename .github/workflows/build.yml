@@ -27,7 +27,7 @@ jobs:
           python3 - << 'PY'
           import urllib.request, urllib.error, json, sys
 
-          ua = "GeoShimApp/1.3 (+https://github.com/nikotbilisi/GeoShim)"
+          ua = "GeoShimApp/1.3.1 (+https://github.com/nikotbilisi/GeoShim)"
           # Dense Manhattan tile z=14, x=4825, y=6156
           tiles = [
               ("OSM", "https://tile.openstreetmap.org/14/4825/6156.png"),
@@ -58,7 +58,7 @@ jobs:
               print(f"Photon CI check note: {e}")
           PY
 
-      - name: Patch daemon (release v1.3 fast-path) + native GeoShimApp v1.3
+      - name: Patch daemon (release v1.3.1 fast-path) + native GeoShimApp v1.3.1
         run: |
           python3 - << 'PY'
           import os, re, plistlib, shutil, struct, zlib, math
@@ -77,7 +77,7 @@ jobs:
           old_anchor = "static IMP gEncodeWithCoderOrig = NULL;"
           xpc_rewriter = old_anchor + r'''
 
-          // --- GeoShim iOS 18 Total IPC Rewriter v1.3 (Release Fast-Path) ---
+          // --- GeoShim iOS 18 Total IPC Rewriter v1.3.1 (Release Fast-Path) ---
           #include <notify.h>
           #include <dispatch/dispatch.h>
           #include <CoreFoundation/CoreFoundation.h>
@@ -123,21 +123,71 @@ jobs:
           extern void xpc_connection_send_message_with_reply(xpc_connection_t conn, xpc_object_t msg, dispatch_queue_t q, xpc_handler_t h);
           #endif
 
-          #define GS_DEG2RAD (3.14159265358979323846 / 180.0)
+          #define GS_DEG2RAD          (3.14159265358979323846 / 180.0)
+          #define GS_FAKE_TOL_LAT     0.00010
+          #define GS_FAKE_TOL_LON     0.00014
+          #define GS_FAKE_TOL_RAD_LAT 0.000002
+          #define GS_FAKE_TOL_RAD_LON 0.000003
+
+          // Lock-free multi-writer seqlock for atomic (lat, lon) pairs (safe in dispatch_mach / XPC hooks)
+          typedef struct {
+            _Atomic uint32_t seq;
+            _Atomic uint64_t latBits;
+            _Atomic uint64_t lonBits;
+          } gs_pair_t;
+
+          static void gs_pair_store(gs_pair_t *p, double lat, double lon) {
+            uint64_t la = 0, lo = 0;
+            memcpy(&la, &lat, 8);
+            memcpy(&lo, &lon, 8);
+            uint32_t s = atomic_load_explicit(&p->seq, memory_order_relaxed);
+            for (int tries = 0; tries < 256; tries++) {
+              if (s & 1u) {
+                s = atomic_load_explicit(&p->seq, memory_order_relaxed);
+                continue;
+              }
+              if (atomic_compare_exchange_weak_explicit(&p->seq, &s, s + 1u,
+                                    memory_order_acquire, memory_order_relaxed)) {
+                atomic_store_explicit(&p->latBits, la, memory_order_relaxed);
+                atomic_store_explicit(&p->lonBits, lo, memory_order_relaxed);
+                atomic_store_explicit(&p->seq, s + 2u, memory_order_release);
+                return;
+              }
+            }
+          }
+
+          static bool gs_pair_load(gs_pair_t *p, double *outLat, double *outLon) {
+            for (int tries = 0; tries < 64; tries++) {
+              uint32_t s1 = atomic_load_explicit(&p->seq, memory_order_acquire);
+              if (s1 & 1u) continue;
+              uint64_t la = atomic_load_explicit(&p->latBits, memory_order_relaxed);
+              uint64_t lo = atomic_load_explicit(&p->lonBits, memory_order_relaxed);
+              atomic_thread_fence(memory_order_acquire);
+              uint32_t s2 = atomic_load_explicit(&p->seq, memory_order_relaxed);
+              if (s1 == s2) {
+                double lat = 0.0, lon = 0.0;
+                memcpy(&lat, &la, 8);
+                memcpy(&lon, &lo, 8);
+                *outLat = lat;
+                *outLon = lon;
+                return true;
+              }
+            }
+            return false;
+          }
 
           static _Atomic uint32_t gDiagEnter = 0;
           static _Atomic uint32_t gDiagSpoof = 0;
           static _Atomic uint32_t gDiagThrow = 0;
 
-          static double gLastRealLat = 0.0, gLastRealLon = 0.0;
+          static gs_pair_t gRealPair;
           static _Atomic uint32_t gHasRealCoord = 0;
-          static double gCandRealLat = 0.0, gCandRealLon = 0.0;
-          static int gCandRealCount = 0;
+          static gs_pair_t gCandRealPair;
+          static _Atomic uint32_t gCandRealCount = 0;
 
           static _Atomic uint32_t gCachedActive = 0;
-          static double gCachedFakeLat = 0.0, gCachedFakeLon = 0.0;
-          static CFAbsoluteTime gCachedFakeTs = 0.0;
-          static int gReloadTok = -1;
+          static gs_pair_t gFakePair;
+          static _Atomic int64_t gCachedFakeMs = 0;
 
           static CFAbsoluteTime gBootTime = 0.0;
           static uint32_t gDaemonPid = 0;
@@ -180,45 +230,54 @@ jobs:
           #define GS_XPC4_NOTIFY   "xyz.regulad.geoshim.xpc4"
           #define GS_PROC_NOTIFY   "xyz.regulad.geoshim.proc"
 
-          static void gs_set_state(const char *name, int *tok, uint64_t val) {
+          // All notifyd tokens pre-registered once in gs_diag_init() (immutable afterward)
+          static int gReloadTok = -1;
+          static int gDiagTok   = -1;
+          static int gRealTok   = -1;
+          static int gTargetTok = -1;
+          static int gProcTok   = -1;
+          static int gXpcTok    = -1;
+          static int gXpc2Tok   = -1;
+          static int gXpc3Tok   = -1;
+          static int gXpc4Tok   = -1;
+
+          static void gs_set_state_tok(int tok, uint64_t val) {
+            if (tok == -1) return;
             int prev = gInXpcHook;
             gInXpcHook = 1;
-            if (*tok == -1) notify_register_check(name, tok);
-            if (*tok != -1) notify_set_state(*tok, val);
+            notify_set_state(tok, val);
             gInXpcHook = prev;
           }
 
           static void gs_publish_target(bool active, double lat, double lon, bool hasCoord) {
-            static int ttok = -1;
             uint64_t tv = active ? (1ULL << 63) : 0ULL;
             if (hasCoord && isfinite(lat) && isfinite(lon) && fabs(lat) <= 90.0 && fabs(lon) <= 180.0) {
               uint64_t ilat = (uint64_t)llround((lat + 90.0) * 100000.0) & 0x1FFFFFFULL;
               uint64_t ilon = (uint64_t)llround((lon + 180.0) * 100000.0) & 0x3FFFFFFULL;
               tv |= (1ULL << 62) | ilat | (ilon << 25);
             }
-            gs_set_state(GS_TARGET_NOTIFY, &ttok, tv);
+            gs_set_state_tok(gTargetTok, tv);
           }
 
           static void gs_diag_publish(void) {
-            static int tok = -1, rtok = -1, ptok = -1;
             uint64_t v = (1ULL << 63)
                    | (uint64_t)(atomic_load(&gDiagEnter) & 0xFFFF)
                    | ((uint64_t)(atomic_load(&gDiagSpoof) & 0xFFFF) << 16)
                    | ((uint64_t)(atomic_load(&gDiagThrow) & 0xFFFF) << 32);
-            gs_set_state(GS_DIAG_NOTIFY, &tok, v);
-            if (atomic_load_explicit(&gHasRealCoord, memory_order_acquire)) {
-              int32_t ilat = (int32_t)llround(gLastRealLat * 10000.0);
-              int32_t ilon = (int32_t)llround(gLastRealLon * 10000.0);
+            gs_set_state_tok(gDiagTok, v);
+            double rlat = 0.0, rlon = 0.0;
+            if (atomic_load_explicit(&gHasRealCoord, memory_order_acquire) && gs_pair_load(&gRealPair, &rlat, &rlon)) {
+              int32_t ilat = (int32_t)llround(rlat * 10000.0);
+              int32_t ilon = (int32_t)llround(rlon * 10000.0);
               uint64_t rv = ((uint64_t)(uint32_t)ilat) | (((uint64_t)(uint32_t)ilon) << 32);
-              gs_set_state(GS_REAL_NOTIFY, &rtok, rv);
+              gs_set_state_tok(gRealTok, rv);
             }
             uint32_t up = gBootTime > 0.0 ? (uint32_t)(CFAbsoluteTimeGetCurrent() - gBootTime) : 0;
             uint64_t pv = ((uint64_t)gDaemonPid) | (((uint64_t)up) << 32);
-            gs_set_state(GS_PROC_NOTIFY, &ptok, pv);
+            gs_set_state_tok(gProcTok, pv);
           }
 
           static void gs_xpc_publish(void) {
-            static int tok = -1, tok2 = -1, tok3 = -1, tok4 = -1, ptok = -1;
             uint64_t v = (1ULL << 63)
                    | ((uint64_t)(atomic_load(&gXpcHookedMsg) & 1) << 62)
                    | ((uint64_t)(atomic_load(&gXpcHookedNotif) & 1) << 61)
@@ -230,29 +289,29 @@ jobs:
                    | ((uint64_t)(atomic_load(&gHookedSess) & 1) << 55)
                    | ((uint64_t)(atomic_load(&gXpcBlobsRewritten) & 0xFFFFF) << 20)
                    | (uint64_t)(atomic_load(&gXpcPairsRewritten) & 0xFFFFF);
-            gs_set_state(GS_XPC_NOTIFY, &tok, v);
+            gs_set_state_tok(gXpcTok, v);
 
             uint64_t v2 = (uint64_t)(atomic_load(&gXpcNonAdjRewritten) & 0xFFFF)
                   | ((uint64_t)(atomic_load(&gXpcDblRewritten) & 0xFFFF) << 16)
                   | ((uint64_t)(atomic_load(&gXpcRadRewritten) & 0xFFFF) << 32)
                   | ((uint64_t)(atomic_load(&gXpcFloatRewritten) & 0xFFFF) << 48);
-            gs_set_state(GS_XPC2_NOTIFY, &tok2, v2);
+            gs_set_state_tok(gXpc2Tok, v2);
 
             uint64_t v3 = (uint64_t)(atomic_load(&gIpcPostLeak) & 0xFFFF)
                   | ((uint64_t)(atomic_load(&gIpcPipeRewritten) & 0xFFFF) << 16)
                   | ((uint64_t)(atomic_load(&gIpcCfmpRewritten) & 0xFFFF) << 32)
                   | ((uint64_t)(atomic_load(&gIpcDmachInHits) & 0xFFFF) << 48);
-            gs_set_state(GS_XPC3_NOTIFY, &tok3, v3);
+            gs_set_state_tok(gXpc3Tok, v3);
 
             uint64_t v4 = (uint64_t)(atomic_load(&gIpcDmachOolHits) & 0xFFFF)
                   | ((uint64_t)(atomic_load(&gAnchorFlips) & 0xFFFF) << 16)
                   | ((uint64_t)(atomic_load(&gXpcShmemSeen) & 0xFFFF) << 32)
                   | ((uint64_t)(atomic_load(&gIpcSessRewritten) & 0xFFFF) << 48);
-            gs_set_state(GS_XPC4_NOTIFY, &tok4, v4);
+            gs_set_state_tok(gXpc4Tok, v4);
 
             uint32_t up = gBootTime > 0.0 ? (uint32_t)(CFAbsoluteTimeGetCurrent() - gBootTime) : 0;
             uint64_t pv = ((uint64_t)gDaemonPid) | (((uint64_t)up) << 32);
-            gs_set_state(GS_PROC_NOTIFY, &ptok, pv);
+            gs_set_state_tok(gProcTok, pv);
           }
 
           static void gs_diag_inc(_Atomic uint32_t *c) { atomic_fetch_add(c, 1); gs_diag_publish(); }
@@ -284,7 +343,7 @@ jobs:
           }
 
           static inline bool gs_is_already_fake(double lat, double lon, double flat, double flon) {
-            return fabs(lat - flat) < 0.002 && fabs(lon - flon) < 0.002;
+            return fabs(lat - flat) < GS_FAKE_TOL_LAT && fabs(lon - flon) < GS_FAKE_TOL_LON;
           }
 
           // Lock-free stack-allocated IEEE-754 high-byte pre-filter (skips ~98.8% of non-matching bytes)
@@ -368,27 +427,31 @@ jobs:
           static void gs_note_live_real_coord(double lat, double lon, double flat, double flon, bool hasFake) {
             if (!isfinite(lat) || !isfinite(lon) || fabs(lat) > 90.0 || fabs(lon) > 180.0) return;
             if (fabs(lat) < 0.1 && fabs(lon) < 0.1) return;
-            if (atomic_load_explicit(&gHasRealCoord, memory_order_acquire)) {
-              if (hasFake && (fabs(flat - gLastRealLat) > 0.08 || fabs(flon - gLastRealLon) > 0.08)) {
+            double curLat = 0.0, curLon = 0.0;
+            if (atomic_load_explicit(&gHasRealCoord, memory_order_acquire) && gs_pair_load(&gRealPair, &curLat, &curLon)) {
+              if (hasFake && (fabs(flat - curLat) > 0.08 || fabs(flon - curLon) > 0.08)) {
                 if (fabs(lat - flat) < 0.05 && fabs(lon - flon) < 0.05) {
                   atomic_fetch_add(&gAnchorFlips, 1);
                   return;
                 }
               }
-              if (fabs(lat - gLastRealLat) > 2.0 || fabs(lon - gLastRealLon) > 2.0) {
+              if (fabs(lat - curLat) > 2.0 || fabs(lon - curLon) > 2.0) {
                 atomic_fetch_add(&gAnchorFlips, 1);
-                if (fabs(lat - gCandRealLat) < 0.5 && fabs(lon - gCandRealLon) < 0.5) {
-                  gCandRealCount++;
-                  if (gCandRealCount < 3) return;
+                double candLat = 0.0, candLon = 0.0;
+                uint32_t cnt = atomic_load_explicit(&gCandRealCount, memory_order_acquire);
+                if (cnt > 0 && gs_pair_load(&gCandRealPair, &candLat, &candLon) &&
+                  fabs(lat - candLat) < 0.5 && fabs(lon - candLon) < 0.5) {
+                  uint32_t next = atomic_fetch_add(&gCandRealCount, 1) + 1;
+                  if (next < 3) return;
                 } else {
-                  gCandRealLat = lat; gCandRealLon = lon; gCandRealCount = 1;
+                  gs_pair_store(&gCandRealPair, lat, lon);
+                  atomic_store_explicit(&gCandRealCount, 1, memory_order_release);
                   return;
                 }
               }
-              gCandRealCount = 0;
+              atomic_store_explicit(&gCandRealCount, 0, memory_order_release);
             }
-            gLastRealLat = lat;
-            gLastRealLon = lon;
+            gs_pair_store(&gRealPair, lat, lon);
             atomic_store_explicit(&gHasRealCoord, 1, memory_order_release);
           }
 
@@ -420,14 +483,14 @@ jobs:
                         return true;
                       }
                       if (checkRad && fabs(d0 - rlatRad) < 0.025 && fabs(d1 - rlonRad) < 0.025 &&
-                        !(fabs(d0 - flatRad) < 0.0001 && fabs(d1 - flonRad) < 0.0001)) {
+                        !(fabs(d0 - flatRad) < GS_FAKE_TOL_RAD_LAT && fabs(d1 - flonRad) < GS_FAKE_TOL_RAD_LON)) {
                         return true;
                       }
                     }
                   }
                   if (checkNonAdj) {
-                    if (fabs(d0 - rlat) < 0.5 && !(fabs(d0 - flat) < 0.002 && fabs(rlat - flat) > 0.002)) hasLatLE = true;
-                    if (fabs(d0 - rlon) < 0.5 && !(fabs(d0 - flon) < 0.002 && fabs(rlon - flon) > 0.002)) hasLonLE = true;
+                    if (fabs(d0 - rlat) < 0.5 && !(fabs(d0 - flat) < GS_FAKE_TOL_LAT && fabs(rlat - flat) > GS_FAKE_TOL_LAT)) hasLatLE = true;
+                    if (fabs(d0 - rlon) < 0.5 && !(fabs(d0 - flon) < GS_FAKE_TOL_LON && fabs(rlon - flon) > GS_FAKE_TOL_LON)) hasLonLE = true;
                     if (hasLatLE && hasLonLE) return true;
                   }
                 }
@@ -448,14 +511,14 @@ jobs:
                         return true;
                       }
                       if (checkRad && fabs(b0d - rlatRad) < 0.025 && fabs(b1d - rlonRad) < 0.025 &&
-                        !(fabs(b0d - flatRad) < 0.0001 && fabs(b1d - flonRad) < 0.0001)) {
+                        !(fabs(b0d - flatRad) < GS_FAKE_TOL_RAD_LAT && fabs(b1d - flonRad) < GS_FAKE_TOL_RAD_LON)) {
                         return true;
                       }
                     }
                   }
                   if (checkNonAdj) {
-                    if (fabs(b0d - rlat) < 0.5 && !(fabs(b0d - flat) < 0.002 && fabs(rlat - flat) > 0.002)) hasLatBE = true;
-                    if (fabs(b0d - rlon) < 0.5 && !(fabs(b0d - flon) < 0.002 && fabs(rlon - flon) > 0.002)) hasLonBE = true;
+                    if (fabs(b0d - rlat) < 0.5 && !(fabs(b0d - flat) < GS_FAKE_TOL_LAT && fabs(rlat - flat) > GS_FAKE_TOL_LAT)) hasLatBE = true;
+                    if (fabs(b0d - rlon) < 0.5 && !(fabs(b0d - flon) < GS_FAKE_TOL_LON && fabs(rlon - flon) > GS_FAKE_TOL_LON)) hasLonBE = true;
                     if (hasLatBE && hasLonBE) return true;
                   }
                 }
@@ -523,7 +586,7 @@ jobs:
                       }
                     }
                     if (checkRad && fabs(d0 - rlatRad) < 0.025 && fabs(d1 - rlonRad) < 0.025) {
-                      if (!(fabs(d0 - flatRad) < 0.0001 && fabs(d1 - flonRad) < 0.0001)) {
+                      if (!(fabs(d0 - flatRad) < GS_FAKE_TOL_RAD_LAT && fabs(d1 - flonRad) < GS_FAKE_TOL_RAD_LON)) {
                         memcpy(buf + off, &flatRad, 8);
                         memcpy(buf + off + 8, &flonRad, 8);
                         radPairs++;
@@ -549,7 +612,7 @@ jobs:
                       }
                     }
                     if (checkRad && fabs(b0d - rlatRad) < 0.025 && fabs(b1d - rlonRad) < 0.025) {
-                      if (!(fabs(b0d - flatRad) < 0.0001 && fabs(b1d - flonRad) < 0.0001)) {
+                      if (!(fabs(b0d - flatRad) < GS_FAKE_TOL_RAD_LAT && fabs(b1d - flonRad) < GS_FAKE_TOL_RAD_LON)) {
                         memcpy(buf + off, &flatRadBE, 8);
                         memcpy(buf + off + 8, &flonRadBE, 8);
                         radPairs++;
@@ -594,8 +657,8 @@ jobs:
                   double d;
                   memcpy(&d, buf + off, 8);
                   if (isfinite(d)) {
-                    if (fabs(d - rlat) < 0.5 && !(fabs(d - flat) < 0.002 && fabs(rlat - flat) > 0.002)) remLatLE = true;
-                    if (fabs(d - rlon) < 0.5 && !(fabs(d - flon) < 0.002 && fabs(rlon - flon) > 0.002)) remLonLE = true;
+                    if (fabs(d - rlat) < 0.5 && !(fabs(d - flat) < GS_FAKE_TOL_LAT && fabs(rlat - flat) > GS_FAKE_TOL_LAT)) remLatLE = true;
+                    if (fabs(d - rlon) < 0.5 && !(fabs(d - flon) < GS_FAKE_TOL_LON && fabs(rlon - flon) > GS_FAKE_TOL_LON)) remLonLE = true;
                   }
                 }
                 if (gs_bm_has(m->dAny, b0)) {
@@ -603,8 +666,8 @@ jobs:
                   memcpy(&u, buf + off, 8);
                   double bd = gs_bswap_d(u);
                   if (isfinite(bd)) {
-                    if (fabs(bd - rlat) < 0.5 && !(fabs(bd - flat) < 0.002 && fabs(rlat - flat) > 0.002)) remLatBE = true;
-                    if (fabs(bd - rlon) < 0.5 && !(fabs(bd - flon) < 0.002 && fabs(rlon - flon) > 0.002)) remLonBE = true;
+                    if (fabs(bd - rlat) < 0.5 && !(fabs(bd - flat) < GS_FAKE_TOL_LAT && fabs(rlat - flat) > GS_FAKE_TOL_LAT)) remLatBE = true;
+                    if (fabs(bd - rlon) < 0.5 && !(fabs(bd - flon) < GS_FAKE_TOL_LON && fabs(rlon - flon) > GS_FAKE_TOL_LON)) remLonBE = true;
                   }
                 }
               }
@@ -616,13 +679,13 @@ jobs:
                   double d;
                   memcpy(&d, buf + off, 8);
                   if (isfinite(d)) {
-                    if (fabs(d - rlat) < 0.5 && !(fabs(d - flat) < 0.002 && fabs(rlat - flat) > 0.002)) {
+                    if (fabs(d - rlat) < 0.5 && !(fabs(d - flat) < GS_FAKE_TOL_LAT && fabs(rlat - flat) > GS_FAKE_TOL_LAT)) {
                       memcpy(buf + off, &flat, 8);
                       nonAdjVals++;
                       off += 7;
                       continue;
                     }
-                    if (fabs(d - rlon) < 0.5 && !(fabs(d - flon) < 0.002 && fabs(rlon - flon) > 0.002)) {
+                    if (fabs(d - rlon) < 0.5 && !(fabs(d - flon) < GS_FAKE_TOL_LON && fabs(rlon - flon) > GS_FAKE_TOL_LON)) {
                       memcpy(buf + off, &flon, 8);
                       nonAdjVals++;
                       off += 7;
@@ -635,13 +698,13 @@ jobs:
                   memcpy(&u, buf + off, 8);
                   double bd = gs_bswap_d(u);
                   if (isfinite(bd)) {
-                    if (fabs(bd - rlat) < 0.5 && !(fabs(bd - flat) < 0.002 && fabs(rlat - flat) > 0.002)) {
+                    if (fabs(bd - rlat) < 0.5 && !(fabs(bd - flat) < GS_FAKE_TOL_LAT && fabs(rlat - flat) > GS_FAKE_TOL_LAT)) {
                       memcpy(buf + off, &flatBE, 8);
                       nonAdjVals++;
                       off += 7;
                       continue;
                     }
-                    if (fabs(bd - rlon) < 0.5 && !(fabs(bd - flon) < 0.002 && fabs(rlon - flon) > 0.002)) {
+                    if (fabs(bd - rlon) < 0.5 && !(fabs(bd - flon) < GS_FAKE_TOL_LON && fabs(rlon - flon) > GS_FAKE_TOL_LON)) {
                       memcpy(buf + off, &flonBE, 8);
                       nonAdjVals++;
                       off += 7;
@@ -728,10 +791,10 @@ jobs:
                   }
                 } else if (vt == XPC_TYPE_DOUBLE && key && dblp->count < 32) {
                   double dv = xpc_double_get_value(val);
-                  if (isfinite(dv) && fabs(dv - rlat) < 0.5 && !(fabs(dv - flat) < 0.002 && fabs(rlat - flat) > 0.002)) {
+                  if (isfinite(dv) && fabs(dv - rlat) < 0.5 && !(fabs(dv - flat) < GS_FAKE_TOL_LAT && fabs(rlat - flat) > GS_FAKE_TOL_LAT)) {
                     char *kcopy = strdup(key);
                     if (kcopy) { dblp->items[dblp->count].key = kcopy; dblp->items[dblp->count].val = flat; dblp->count++; dblp->hasLat = true; }
-                  } else if (isfinite(dv) && fabs(dv - rlon) < 0.5 && !(fabs(dv - flon) < 0.002 && fabs(rlon - flon) > 0.002)) {
+                  } else if (isfinite(dv) && fabs(dv - rlon) < 0.5 && !(fabs(dv - flon) < GS_FAKE_TOL_LON && fabs(rlon - flon) > GS_FAKE_TOL_LON)) {
                     char *kcopy = strdup(key);
                     if (kcopy) { dblp->items[dblp->count].key = kcopy; dblp->items[dblp->count].val = flon; dblp->count++; dblp->hasLon = true; }
                   }
@@ -791,9 +854,9 @@ jobs:
                   }
                 } else if (vt == XPC_TYPE_DOUBLE && adp->count < 32) {
                   double dv = xpc_double_get_value(val);
-                  if (isfinite(dv) && fabs(dv - rlat) < 0.5 && !(fabs(dv - flat) < 0.002 && fabs(rlat - flat) > 0.002)) {
+                  if (isfinite(dv) && fabs(dv - rlat) < 0.5 && !(fabs(dv - flat) < GS_FAKE_TOL_LAT && fabs(rlat - flat) > GS_FAKE_TOL_LAT)) {
                     adp->items[adp->count].idx = idx; adp->items[adp->count].val = flat; adp->count++; adp->hasLat = true;
-                  } else if (isfinite(dv) && fabs(dv - rlon) < 0.5 && !(fabs(dv - flon) < 0.002 && fabs(rlon - flon) > 0.002)) {
+                  } else if (isfinite(dv) && fabs(dv - rlon) < 0.5 && !(fabs(dv - flon) < GS_FAKE_TOL_LON && fabs(rlon - flon) > GS_FAKE_TOL_LON)) {
                     adp->items[adp->count].idx = idx; adp->items[adp->count].val = flon; adp->count++; adp->hasLon = true;
                   }
                 } else if (vt == XPC_TYPE_SHMEM) {
@@ -836,20 +899,22 @@ jobs:
                 if (gReloadTok != -1) {
                   notify_check(gReloadTok, &reloadChanged);
                 }
-                if (reloadChanged != 0) gCachedFakeTs = 0.0;
-                CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-                if (reloadChanged != 0 || now - gCachedFakeTs >= 0.15 || gCachedFakeTs == 0.0 || prevActive == 0) {
+                int64_t nowMs = (int64_t)(CFAbsoluteTimeGetCurrent() * 1000.0);
+                int64_t prevMs = atomic_load_explicit(&gCachedFakeMs, memory_order_acquire);
+                if (reloadChanged != 0 || prevMs == 0 || (nowMs - prevMs) >= 150 || prevActive == 0) {
                   CLLocation *dummy = [[CLLocation alloc] initWithLatitude:rlat longitude:rlon];
                   CLLocation *fake = [factory spoofedLocationFromReal:dummy];
                   if (!fake || !CLLocationCoordinate2DIsValid(fake.coordinate)) return false;
-                  gCachedFakeLat = fake.coordinate.latitude;
-                  gCachedFakeLon = fake.coordinate.longitude;
-                  gCachedFakeTs = now;
-                  gs_publish_target(true, gCachedFakeLat, gCachedFakeLon, true);
+                  double flat = fake.coordinate.latitude;
+                  double flon = fake.coordinate.longitude;
+                  gs_pair_store(&gFakePair, flat, flon);
+                  atomic_store_explicit(&gCachedFakeMs, nowMs, memory_order_release);
+                  gs_publish_target(true, flat, flon, true);
+                  *outFlat = flat;
+                  *outFlon = flon;
+                  return true;
                 }
-                *outFlat = gCachedFakeLat;
-                *outFlon = gCachedFakeLon;
-                return true;
+                return gs_pair_load(&gFakePair, outFlat, outFlon);
               } @catch (NSException *e) {
                 (void)e;
                 return false;
@@ -859,7 +924,8 @@ jobs:
 
           static bool gs_handle_outbound_xpc(xpc_object_t msg) {
             if (!msg || !atomic_load_explicit(&gHasRealCoord, memory_order_acquire)) return false;
-            double rlat = gLastRealLat, rlon = gLastRealLon;
+            double rlat = 0.0, rlon = 0.0;
+            if (!gs_pair_load(&gRealPair, &rlat, &rlon)) return false;
             if (fabs(rlat) < 0.05 && fabs(rlon) < 0.05) return false;
             double flat = 0.0, flon = 0.0;
             if (!gs_refresh_fake_coord(rlat, rlon, &flat, &flon)) return false;
@@ -878,8 +944,9 @@ jobs:
             if (!dmsg || !gDmmGetMsg) return;
             if (!atomic_load_explicit(&gCachedActive, memory_order_acquire)) return;
             if (!atomic_load_explicit(&gHasRealCoord, memory_order_acquire)) return;
-            double rlat = gLastRealLat, rlon = gLastRealLon;
-            double flat = gCachedFakeLat, flon = gCachedFakeLon;
+            double rlat = 0.0, rlon = 0.0, flat = 0.0, flon = 0.0;
+            if (!gs_pair_load(&gRealPair, &rlat, &rlon)) return;
+            if (!gs_pair_load(&gFakePair, &flat, &flon)) return;
             if ((fabs(rlat) < 0.05 && fabs(rlon) < 0.05) || (fabs(flat) < 0.0001 && fabs(flon) < 0.0001)) return;
 
             size_t sz = 0;
@@ -1050,20 +1117,22 @@ jobs:
             uint8_t *buf = NULL;
             if (!gInXpcHook && data && atomic_load_explicit(&gHasRealCoord, memory_order_acquire)) {
               gInXpcHook = 1;
-              double rlat = gLastRealLat, rlon = gLastRealLon;
-              double flat = 0.0, flon = 0.0;
-              if (gs_refresh_fake_coord(rlat, rlon, &flat, &flon)) {
-                const uint8_t *p = CFDataGetBytePtr(data);
-                CFIndex clen = CFDataGetLength(data);
-                if (p && clen >= 16) {
-                  gs_coord_masks_t masks;
-                  gs_build_coord_masks(&masks, rlat, rlon);
-                  uint32_t pairs = 0;
-                  bool na = false, rad = false, f32 = false;
-                  buf = gs_make_patched_blob(p, (size_t)clen, rlat, rlon, flat, flon, &masks, &pairs, &na, &rad, &f32);
-                  if (buf) {
-                    patchedRef = CFDataCreate(kCFAllocatorDefault, buf, clen);
-                    if (patchedRef) atomic_fetch_add(&gIpcCfmpRewritten, 1);
+              double rlat = 0.0, rlon = 0.0;
+              if (gs_pair_load(&gRealPair, &rlat, &rlon)) {
+                double flat = 0.0, flon = 0.0;
+                if (gs_refresh_fake_coord(rlat, rlon, &flat, &flon)) {
+                  const uint8_t *p = CFDataGetBytePtr(data);
+                  CFIndex clen = CFDataGetLength(data);
+                  if (p && clen >= 16) {
+                    gs_coord_masks_t masks;
+                    gs_build_coord_masks(&masks, rlat, rlon);
+                    uint32_t pairs = 0;
+                    bool na = false, rad = false, f32 = false;
+                    buf = gs_make_patched_blob(p, (size_t)clen, rlat, rlon, flat, flon, &masks, &pairs, &na, &rad, &f32);
+                    if (buf) {
+                      patchedRef = CFDataCreate(kCFAllocatorDefault, buf, clen);
+                      if (patchedRef) atomic_fetch_add(&gIpcCfmpRewritten, 1);
+                    }
                   }
                 }
               }
@@ -1102,26 +1171,32 @@ jobs:
             gBootTime = CFAbsoluteTimeGetCurrent();
             gDaemonPid = (uint32_t)getpid();
 
+            // Pre-register all notifyd channels once on the single-threaded constructor path
             if (notify_register_check(GS_RELOAD_NOTIFY, &gReloadTok) == NOTIFY_STATUS_OK && gReloadTok != -1) {
               int initChk = 0;
               notify_check(gReloadTok, &initChk);
             }
+            notify_register_check(GS_DIAG_NOTIFY,   &gDiagTok);
+            notify_register_check(GS_REAL_NOTIFY,   &gRealTok);
+            notify_register_check(GS_TARGET_NOTIFY, &gTargetTok);
+            notify_register_check(GS_PROC_NOTIFY,   &gProcTok);
+            notify_register_check(GS_XPC_NOTIFY,    &gXpcTok);
+            notify_register_check(GS_XPC2_NOTIFY,   &gXpc2Tok);
+            notify_register_check(GS_XPC3_NOTIFY,   &gXpc3Tok);
+            notify_register_check(GS_XPC4_NOTIFY,   &gXpc4Tok);
 
-            int rtok = -1;
-            if (notify_register_check(GS_REAL_NOTIFY, &rtok) == NOTIFY_STATUS_OK && rtok != -1) {
+            if (gRealTok != -1) {
               uint64_t rv = 0;
-              if (notify_get_state(rtok, &rv) == NOTIFY_STATUS_OK && rv != 0) {
+              if (notify_get_state(gRealTok, &rv) == NOTIFY_STATUS_OK && rv != 0) {
                 int32_t ilat = (int32_t)(uint32_t)(rv & 0xFFFFFFFFULL);
                 int32_t ilon = (int32_t)(uint32_t)((rv >> 32) & 0xFFFFFFFFULL);
                 double rlat = ilat / 10000.0, rlon = ilon / 10000.0;
                 if (isfinite(rlat) && isfinite(rlon) && fabs(rlat) <= 90.0 && fabs(rlon) <= 180.0 &&
                   (fabs(rlat) > 0.1 || fabs(rlon) > 0.1)) {
-                  gLastRealLat = rlat;
-                  gLastRealLon = rlon;
+                  gs_pair_store(&gRealPair, rlat, rlon);
                   atomic_store_explicit(&gHasRealCoord, 1, memory_order_release);
                 }
               }
-              notify_cancel(rtok);
             }
 
             gs_diag_publish();
@@ -1257,9 +1332,8 @@ jobs:
                               CLLocation *fake = [factory spoofedLocationFromReal:real];
                               bool hasFake = (fake && CLLocationCoordinate2DIsValid(fake.coordinate));
                               if (hasFake) {
-                                  gCachedFakeLat = fake.coordinate.latitude;
-                                  gCachedFakeLon = fake.coordinate.longitude;
-                                  gCachedFakeTs = CFAbsoluteTimeGetCurrent();
+                                  gs_pair_store(&gFakePair, fake.coordinate.latitude, fake.coordinate.longitude);
+                                  atomic_store_explicit(&gCachedFakeMs, (int64_t)(CFAbsoluteTimeGetCurrent() * 1000.0), memory_order_release);
                                   gs_publish_target(true, fake.coordinate.latitude, fake.coordinate.longitude, true);
                               }
                               if (real.horizontalAccuracy > 0.0 && real.horizontalAccuracy < 10000.0 && age < 30.0) {
@@ -1378,7 +1452,7 @@ jobs:
           m = m.replace(old_visit, new_visit, 1)
           open("cli/main.m", "w").write(m)
 
-          # 5. Native GeoShimApp v1.3 (60 FPS inertia/zoom, 1-tap quick favorites, single CLI probe, instant reload, local search cache)
+          # 5. Native GeoShimApp v1.3.1 (60 FPS inertia/zoom, pinch-lock, NSNull-safe search, EINTR-safe CLI, instant reload)
           os.makedirs("app/Resources", exist_ok=True)
 
           def make_icon_png(size, out_path):
@@ -1465,9 +1539,9 @@ jobs:
               <key>CFBundlePackageType</key>
               <string>APPL</string>
               <key>CFBundleShortVersionString</key>
-              <string>1.3</string>
+              <string>1.3.1</string>
               <key>CFBundleVersion</key>
-              <string>4</string>
+              <string>5</string>
               <key>CFBundleIcons</key>
               <dict>
                   <key>CFBundlePrimaryIcon</key>
@@ -1563,6 +1637,7 @@ jobs:
           #import <spawn.h>
           #import <sys/wait.h>
           #import <unistd.h>
+          #import <stdlib.h>
           #import <errno.h>
           #import <string.h>
           #import <math.h>
@@ -1572,12 +1647,35 @@ jobs:
           static NSString * const kFavoritesKey    = @"GSAppFavoritesV1";
           static NSString * const kAltitudeKey     = @"GSAppAltitudeV1";
           static NSString * const kJitterIdxKey    = @"GSAppJitterIdxV1";
+          static NSString * const kJitterCapKey    = @"GSAppJitterCapV1";
           static NSString * const kMapStyleKey     = @"GSAppMapStyleV2";
           static NSString * const kLastLatKey      = @"GSAppLastLatV1";
           static NSString * const kLastLonKey      = @"GSAppLastLonV1";
           static NSString * const kSearchCacheKey  = @"GSAppSearchCacheV1";
           static NSString * const kRecentPlacesKey = @"GSAppRecentPlacesV1";
-          static NSString * const kTileUA          = @"GeoShimApp/1.3 (+https://github.com/nikotbilisi/GeoShim)";
+          static NSString * const kTileUA          = @"GeoShimApp/1.3.1 (+https://github.com/nikotbilisi/GeoShim)";
+
+          static NSString *gsStr(id v) {
+            if (![v isKindOfClass:[NSString class]]) return nil;
+            NSString *s = [(NSString *)v stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            return s.length ? s : nil;
+          }
+
+          static BOOL gsDbl(id v, double *outVal) {
+            if ([v isKindOfClass:[NSNumber class]]) {
+              double d = [(NSNumber *)v doubleValue];
+              if (isfinite(d)) { if (outVal) *outVal = d; return YES; }
+              return NO;
+            }
+            if ([v isKindOfClass:[NSString class]]) {
+              NSString *s = [(NSString *)v stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+              if (!s.length) return NO;
+              char *end = NULL;
+              double d = strtod(s.UTF8String, &end);
+              if (end != s.UTF8String && isfinite(d)) { if (outVal) *outVal = d; return YES; }
+            }
+            return NO;
+          }
 
           static NSString *gsJBRootPath(void) {
             NSString *bundle = NSBundle.mainBundle.bundlePath;
@@ -1637,14 +1735,25 @@ jobs:
             int exitCode = -3;
             if (rc == 0 && pid > 0) {
               uint8_t tmp[1024];
-              ssize_t n = 0;
-              while ((n = read(pipefd[0], tmp, sizeof(tmp))) > 0) {
-                [buf appendBytes:tmp length:(NSUInteger)n];
+              for (;;) {
+                ssize_t n = read(pipefd[0], tmp, sizeof(tmp));
+                if (n > 0) {
+                  [buf appendBytes:tmp length:(NSUInteger)n];
+                } else if (n == 0) {
+                  break;
+                } else if (errno != EINTR) {
+                  break;
+                }
               }
               int status = 0;
-              waitpid(pid, &status, 0);
-              if (WIFEXITED(status)) exitCode = WEXITSTATUS(status);
-              else if (WIFSIGNALED(status)) exitCode = 128 + WTERMSIG(status);
+              pid_t wr = -1;
+              do {
+                wr = waitpid(pid, &status, 0);
+              } while (wr == -1 && errno == EINTR);
+              if (wr == pid) {
+                if (WIFEXITED(status)) exitCode = WEXITSTATUS(status);
+                else if (WIFSIGNALED(status)) exitCode = 128 + WTERMSIG(status);
+              }
             } else {
               if (outText) *outText = [NSString stringWithFormat:@"posix_spawn rc=%d (%s)", rc, strerror(rc)];
               exitCode = -rc;
@@ -1814,6 +1923,9 @@ jobs:
           @property (nonatomic, assign) CFTimeInterval zoomStartTs;
           @property (nonatomic, assign) CFTimeInterval zoomDuration;
 
+          @property (nonatomic, weak) UIPinchGestureRecognizer *pinchGR;
+          @property (nonatomic, assign) CFTimeInterval pinchEndedTs;
+          @property (nonatomic, assign) BOOL pinchNeedsReanchor;
           @property (nonatomic, assign) double pinchStartZoom;
           @property (nonatomic, assign) double pinchAnchorLat;
           @property (nonatomic, assign) double pinchAnchorLon;
@@ -1891,6 +2003,7 @@ jobs:
               UIPinchGestureRecognizer *pinch = [[UIPinchGestureRecognizer alloc] initWithTarget:self action:@selector(handlePinch:)];
               pinch.delegate = self;
               [self addGestureRecognizer:pinch];
+              _pinchGR = pinch;
 
               UITapGestureRecognizer *doubleTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleDoubleTap:)];
               doubleTap.numberOfTapsRequired = 2;
@@ -2202,10 +2315,9 @@ jobs:
                 if (img) {
                   if (isCurrent) [self.inFlightTasks removeObjectForKey:cacheKey];
                   [self.tileCache setObject:img forKey:cacheKey];
-                  if (!silent) {
-                    if (self.onTileError) self.onTileError(nil);
-                    [self applyLoadedImage:img forCacheKey:cacheKey];
-                  }
+                  if (!silent && self.onTileError) self.onTileError(nil);
+                  // Always apply loaded image (user may have zoomed onto a silent-prefetched tile)
+                  [self applyLoadedImage:img forCacheKey:cacheKey];
                 } else if (!isFallback && style == 0 && z <= 18 && self.styleIndex == style) {
                   if (isCurrent) [self.inFlightTasks removeObjectForKey:cacheKey];
                   [self fetchTileKey:cacheKey style:2 z:z x:x y:y isFallback:YES silent:silent];
@@ -2244,7 +2356,17 @@ jobs:
             [self animateZoomTo:baseZ + delta anchorPoint:centerPt duration:0.20];
           }
 
+          - (BOOL)isPinchBlockingPan {
+            UIGestureRecognizerState ps = self.pinchGR.state;
+            if (ps == UIGestureRecognizerStateBegan || ps == UIGestureRecognizerStateChanged) return YES;
+            return (CACurrentMediaTime() - self.pinchEndedTs) < 0.16;
+          }
+
           - (void)handlePan:(UIPanGestureRecognizer *)gr {
+            if ([self isPinchBlockingPan]) {
+              [gr setTranslation:CGPointZero inView:self];
+              return;
+            }
             if (gr.state == UIGestureRecognizerStateBegan) {
               [self stopAnimations];
               if (self.onInteraction) self.onInteraction();
@@ -2274,15 +2396,31 @@ jobs:
 
           - (void)handlePinch:(UIPinchGestureRecognizer *)gr {
             if (gr.state == UIGestureRecognizerStateBegan) {
+              if (gr.numberOfTouches < 2) return;
               [self stopAnimations];
               if (self.onInteraction) self.onInteraction();
+              self.pinchNeedsReanchor = NO;
               self.pinchStartZoom = self.zoom;
               CGPoint loc = [gr locationInView:self];
               CLLocationCoordinate2D anchor = [self coordForScreenPoint:loc];
               self.pinchAnchorLat = anchor.latitude;
               self.pinchAnchorLon = anchor.longitude;
             } else if (gr.state == UIGestureRecognizerStateChanged) {
+              if (gr.numberOfTouches < 2) {
+                self.pinchNeedsReanchor = YES;
+                self.pinchEndedTs = CACurrentMediaTime();
+                return;
+              }
               CGPoint loc = [gr locationInView:self];
+              if (self.pinchNeedsReanchor) {
+                self.pinchNeedsReanchor = NO;
+                self.pinchStartZoom = self.zoom;
+                CLLocationCoordinate2D anchor = [self coordForScreenPoint:loc];
+                self.pinchAnchorLat = anchor.latitude;
+                self.pinchAnchorLon = anchor.longitude;
+                gr.scale = 1.0;
+                return;
+              }
               double newZ = fmax(2.0, fmin(19.0, self.pinchStartZoom + log2(fmax(0.1, gr.scale))));
               double w = gsWorldSize(newZ);
               double ax = gsLonToX(self.pinchAnchorLon, newZ);
@@ -2294,6 +2432,11 @@ jobs:
               self.centerLon = gsXToLon(cx, newZ);
               self.centerLat = gsYToLat(cy, newZ);
               [self reloadTiles];
+            } else if (gr.state == UIGestureRecognizerStateEnded ||
+                   gr.state == UIGestureRecognizerStateCancelled ||
+                   gr.state == UIGestureRecognizerStateFailed) {
+              self.pinchNeedsReanchor = NO;
+              self.pinchEndedTs = CACurrentMediaTime();
             }
           }
 
@@ -2361,7 +2504,8 @@ jobs:
             }];
             [ac addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
             [ac addAction:[UIAlertAction actionWithTitle:@"Сохранить" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-              NSString *name = [ac.textFields.firstObject.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+              (void)a;
+              NSString *name = gsStr(ac.textFields.firstObject.text);
               if (!name.length) name = [NSString stringWithFormat:@"Точка %lu", (unsigned long)(self.items.count + 1)];
               [self.items insertObject:@{@"name": name, @"lat": @(self.currentCoord.latitude), @"lon": @(self.currentCoord.longitude)} atIndex:0];
               [self persist];
@@ -2370,15 +2514,22 @@ jobs:
             [self presentViewController:ac animated:YES completion:nil];
           }
 
-          - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section { return self.items.count; }
+          - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+            (void)tableView; (void)section;
+            return self.items.count;
+          }
 
           - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
             UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"fav"];
             if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"fav"];
-            NSDictionary *d = self.items[indexPath.row];
-            cell.textLabel.text = d[@"name"];
+            if ((NSUInteger)indexPath.row >= self.items.count) return cell;
+            NSDictionary *d = [self.items[indexPath.row] isKindOfClass:[NSDictionary class]] ? self.items[indexPath.row] : @{};
+            double lat = 0.0, lon = 0.0;
+            gsDbl(d[@"lat"], &lat);
+            gsDbl(d[@"lon"], &lon);
+            cell.textLabel.text = gsStr(d[@"name"]) ?: @"Точка";
             cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"%.6f, %.6f", [d[@"lat"] doubleValue], [d[@"lon"] doubleValue]];
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"%.6f, %.6f", lat, lon];
             cell.detailTextLabel.font = [UIFont monospacedDigitSystemFontOfSize:12 weight:UIFontWeightRegular];
             cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
@@ -2387,8 +2538,10 @@ jobs:
 
           - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
             [tableView deselectRowAtIndexPath:indexPath animated:YES];
-            NSDictionary *d = self.items[indexPath.row];
-            double lat = [d[@"lat"] doubleValue], lon = [d[@"lon"] doubleValue];
+            if ((NSUInteger)indexPath.row >= self.items.count) return;
+            NSDictionary *d = [self.items[indexPath.row] isKindOfClass:[NSDictionary class]] ? self.items[indexPath.row] : nil;
+            double lat = 0.0, lon = 0.0;
+            if (!d || !gsDbl(d[@"lat"], &lat) || !gsDbl(d[@"lon"], &lon)) return;
             [self dismissViewControllerAnimated:YES completion:^{
               if (self.onPick) self.onPick(lat, lon);
             }];
@@ -2396,6 +2549,7 @@ jobs:
 
           - (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
             UIContextualAction *del = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive title:@"Удалить" handler:^(UIContextualAction *a, UIView *v, void (^done)(BOOL)) {
+              (void)a; (void)v;
               [self.items removeObjectAtIndex:indexPath.row];
               [self persist];
               [tableView deleteRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationAutomatic];
@@ -2414,6 +2568,7 @@ jobs:
           @property (nonatomic, strong) UITableView *resultsTable;
           @property (nonatomic, strong) NSArray<NSDictionary *> *searchResults;
           @property (nonatomic, strong) NSURLSessionDataTask *searchTask;
+          @property (nonatomic, assign) NSUInteger searchGeneration;
           @property (nonatomic, strong) UILabel *toastLabel;
           @property (nonatomic, strong) UIButton *styleBadge;
 
@@ -2433,13 +2588,14 @@ jobs:
 
           @property (nonatomic, strong) dispatch_queue_t cliQueue;
           @property (nonatomic, assign) NSUInteger applyGeneration;
-          @property (nonatomic, assign) NSInteger jitterFlagSupport; // 0=unknown, 1=yes, -1=no
+          @property (nonatomic, assign) NSInteger cliJitterCap; // owned by cliQueue: 0=unknown, 1=yes, -1=no
           @property (nonatomic, strong) NSMutableDictionary<NSString *, NSDictionary *> *searchCache;
           @property (nonatomic, strong) NSMutableArray<NSDictionary *> *recentPlaces;
 
           @property (nonatomic, assign) CLLocationCoordinate2D selectedCoord;
           @property (nonatomic, assign) double altitudeMeters;
           @property (nonatomic, assign) BOOL cliKnownActive;
+          @property (nonatomic, assign) BOOL userInteracted;
           @property (nonatomic, assign) CFAbsoluteTime optimisticUntil;
           @property (nonatomic, assign) BOOL optimisticState;
           @property (nonatomic, strong) NSTimer *pollTimer;
@@ -2453,6 +2609,7 @@ jobs:
             self.cliQueue = dispatch_queue_create("xyz.regulad.geoshim.cli", DISPATCH_QUEUE_SERIAL);
 
             NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+            self.cliJitterCap = [ud integerForKey:kJitterCapKey];
             NSDictionary *savedCache = [ud dictionaryForKey:kSearchCacheKey];
             self.searchCache = savedCache ? [savedCache mutableCopy] : [NSMutableDictionary dictionary];
             NSArray *savedRecent = [ud arrayForKey:kRecentPlacesKey];
@@ -2486,6 +2643,11 @@ jobs:
             [self refreshStatus];
             [self syncInitialCLIStatus];
 
+            [NSNotificationCenter.defaultCenter addObserver:self
+                                 selector:@selector(appDidBecomeActive)
+                                   name:UIApplicationDidBecomeActiveNotification
+                                 object:nil];
+
             __weak typeof(self) weakSelf = self;
             self.pollTimer = [NSTimer scheduledTimerWithTimeInterval:1.5 repeats:YES block:^(NSTimer *t) {
               (void)t;
@@ -2493,28 +2655,27 @@ jobs:
             }];
           }
 
-          - (void)dealloc { [self.pollTimer invalidate]; }
+          - (void)dealloc {
+            [NSNotificationCenter.defaultCenter removeObserver:self];
+            [self.pollTimer invalidate];
+          }
+
+          - (void)appDidBecomeActive {
+            [self refreshStatus];
+          }
+
+          - (void)cancelPendingSearch {
+            self.searchGeneration++;
+            [self.searchTask cancel];
+            self.searchTask = nil;
+            [self.searchSpinner stopAnimating];
+          }
 
           - (void)syncInitialCLIStatus {
+            __weak typeof(self) weakSelf = self;
             dispatch_async(self.cliQueue, ^{
               NSString *out = nil;
               int rc = gsRunCLI(@[@"status"], &out);
-
-              // Probe --jitter flag support once so applySpoofTapped never wastes a double spawn
-              NSString *helpOut = nil;
-              gsRunCLI(@[@"--help"], &helpOut);
-              if (!helpOut.length || [helpOut rangeOfString:@"jitter"].location == NSNotFound) {
-                NSString *helpStart = nil;
-                gsRunCLI(@[@"start", @"--help"], &helpStart);
-                if (helpStart.length) helpOut = [NSString stringWithFormat:@"%@\n%@", helpOut ?: @"", helpStart];
-              }
-              NSInteger jCap = 0;
-              if ([helpOut rangeOfString:@"--jitter"].location != NSNotFound) {
-                jCap = 1;
-              } else if (helpOut.length > 0 && ([helpOut rangeOfString:@"start"].location != NSNotFound || [helpOut rangeOfString:@"-x"].location != NSNotFound)) {
-                jCap = -1;
-              }
-
               BOOL en = NO;
               CLLocationCoordinate2D parsedCoord = CLLocationCoordinate2DMake(0, 0);
               BOOL hasCoord = NO;
@@ -2527,10 +2688,11 @@ jobs:
                 }
               }
               dispatch_async(dispatch_get_main_queue(), ^{
-                if (jCap != 0) self.jitterFlagSupport = jCap;
+                __strong typeof(weakSelf) self = weakSelf;
+                if (!self) return;
                 if (rc == 0 && out.length) {
                   self.cliKnownActive = en;
-                  if (hasCoord) {
+                  if (en && hasCoord && !self.userInteracted) {
                     [self movePinTo:parsedCoord centerMap:YES zoom:15.0];
                   }
                   [self refreshStatus];
@@ -2564,11 +2726,14 @@ jobs:
             __weak typeof(self) weakSelf = self;
             self.mapView.onPinChanged = ^(CLLocationCoordinate2D c) {
               [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight] impactOccurred];
+              weakSelf.userInteracted = YES;
               weakSelf.selectedCoord = c;
               weakSelf.coordLabel.text = [NSString stringWithFormat:@"%.6f, %.6f", c.latitude, c.longitude];
               [weakSelf updateQuickBarHighlights];
             };
             self.mapView.onInteraction = ^{
+              weakSelf.userInteracted = YES;
+              [weakSelf cancelPendingSearch];
               [weakSelf.view endEditing:YES];
               weakSelf.resultsTable.hidden = YES;
             };
@@ -2870,8 +3035,8 @@ jobs:
             self.quickBarScroll.hidden = NO;
 
             for (NSUInteger i = 0; i < self.quickFavorites.count; i++) {
-              NSDictionary *d = self.quickFavorites[i];
-              NSString *name = [d[@"name"] isKindOfClass:[NSString class]] ? d[@"name"] : @"Точка";
+              NSDictionary *d = [self.quickFavorites[i] isKindOfClass:[NSDictionary class]] ? self.quickFavorites[i] : @{};
+              NSString *name = gsStr(d[@"name"]) ?: @"Точка";
               if (name.length > 18) name = [[name substringToIndex:17] stringByAppendingString:@"…"];
 
               UIButton *chip = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -2903,9 +3068,11 @@ jobs:
               NSInteger idx = chip.tag;
               BOOL isSelected = NO;
               if (idx >= 0 && idx < (NSInteger)self.quickFavorites.count) {
-                NSDictionary *d = self.quickFavorites[(NSUInteger)idx];
-                double lat = [d[@"lat"] doubleValue], lon = [d[@"lon"] doubleValue];
-                isSelected = (fabs(lat - self.selectedCoord.latitude) < 0.0005 && fabs(lon - self.selectedCoord.longitude) < 0.0005);
+                NSDictionary *d = [self.quickFavorites[(NSUInteger)idx] isKindOfClass:[NSDictionary class]] ? self.quickFavorites[(NSUInteger)idx] : nil;
+                double lat = 0.0, lon = 0.0;
+                if (d && gsDbl(d[@"lat"], &lat) && gsDbl(d[@"lon"], &lon)) {
+                  isSelected = (fabs(lat - self.selectedCoord.latitude) < 0.0005 && fabs(lon - self.selectedCoord.longitude) < 0.0005);
+                }
               }
               if (isSelected && active) {
                 chip.backgroundColor = UIColor.systemGreenColor;
@@ -2923,10 +3090,13 @@ jobs:
           - (void)quickFavoriteTapped:(UIButton *)sender {
             NSInteger idx = sender.tag;
             if (idx < 0 || idx >= (NSInteger)self.quickFavorites.count) return;
+            self.userInteracted = YES;
+            [self cancelPendingSearch];
             [self.view endEditing:YES];
             self.resultsTable.hidden = YES;
-            NSDictionary *d = self.quickFavorites[(NSUInteger)idx];
-            double lat = [d[@"lat"] doubleValue], lon = [d[@"lon"] doubleValue];
+            NSDictionary *d = [self.quickFavorites[(NSUInteger)idx] isKindOfClass:[NSDictionary class]] ? self.quickFavorites[(NSUInteger)idx] : nil;
+            double lat = 0.0, lon = 0.0;
+            if (!d || !gsDbl(d[@"lat"], &lat) || !gsDbl(d[@"lon"], &lon)) return;
             double targetZ = (self.mapView.zoom >= 13.0) ? 0.0 : 15.0;
             [self movePinTo:CLLocationCoordinate2DMake(lat, lon) centerMap:YES zoom:targetZ];
             [self applySpoofTapped];
@@ -2955,11 +3125,12 @@ jobs:
           }
 
           - (void)jitterChanged { [NSUserDefaults.standardUserDefaults setInteger:self.jitterControl.selectedSegmentIndex forKey:kJitterIdxKey]; }
-          - (void)zoomInTapped  { [self.mapView zoomBy:1.0]; }
-          - (void)zoomOutTapped { [self.mapView zoomBy:-1.0]; }
-          - (void)centerOnPin   { [self movePinTo:self.selectedCoord centerMap:YES zoom:0]; }
+          - (void)zoomInTapped  { self.userInteracted = YES; [self.mapView zoomBy:1.0]; }
+          - (void)zoomOutTapped { self.userInteracted = YES; [self.mapView zoomBy:-1.0]; }
+          - (void)centerOnPin   { self.userInteracted = YES; [self movePinTo:self.selectedCoord centerMap:YES zoom:0]; }
 
           - (void)centerOnRealTapped {
+            self.userInteracted = YES;
             CLLocationCoordinate2D rc;
             if (gsReadRealCoord(&rc)) {
               [self.mapView stopAnimations];
@@ -2985,8 +3156,9 @@ jobs:
             }];
             [ac addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
             [ac addAction:[UIAlertAction actionWithTitle:@"ОК" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-              double v = [ac.textFields.firstObject.text doubleValue];
-              if (isfinite(v) && v >= -100.0 && v <= 10000.0) {
+              (void)a;
+              double v = 0.0;
+              if (gsDbl(ac.textFields.firstObject.text, &v) && v >= -100.0 && v <= 10000.0) {
                 self.altitudeMeters = v;
                 [NSUserDefaults.standardUserDefaults setDouble:v forKey:kAltitudeKey];
                 [self.altButton setTitle:[NSString stringWithFormat:@"Высота: %.0fm", v] forState:UIControlStateNormal];
@@ -3048,6 +3220,7 @@ jobs:
 
           - (void)applySpoofTapped {
             [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium] impactOccurred];
+            self.userInteracted = YES;
             double lat = self.selectedCoord.latitude;
             double lon = self.selectedCoord.longitude;
             NSString *latS = [NSString stringWithFormat:@"%.6f", lat];
@@ -3065,27 +3238,34 @@ jobs:
             [self refreshStatus];
 
             NSUInteger gen = ++self.applyGeneration;
-            NSInteger jCap = self.jitterFlagSupport;
             dispatch_queue_t q = self.cliQueue;
+            __weak typeof(self) weakSelf = self;
 
             dispatch_async(q, ^{
+              __strong typeof(weakSelf) s = weakSelf;
+              if (!s) return;
               NSString *out = nil;
               int rc = -1;
-              NSInteger detectedCap = 0;
 
-              if (jCap == -1) {
+              if (s.cliJitterCap == -1) {
                 rc = gsRunCLI(argsBase, &out);
               } else {
                 rc = gsRunCLI(argsFull, &out);
                 if (rc == 0) {
-                  detectedCap = 1;
+                  if (s.cliJitterCap != 1) {
+                    s.cliJitterCap = 1;
+                    [NSUserDefaults.standardUserDefaults setInteger:1 forKey:kJitterCapKey];
+                  }
                 } else {
                   NSString *out2 = nil;
                   int rc2 = gsRunCLI(argsBase, &out2);
                   if (rc2 == 0) {
                     rc = 0;
                     out = out2;
-                    detectedCap = -1;
+                    if (s.cliJitterCap != -1) {
+                      s.cliJitterCap = -1;
+                      [NSUserDefaults.standardUserDefaults setInteger:-1 forKey:kJitterCapKey];
+                    }
                   }
                 }
               }
@@ -3093,8 +3273,8 @@ jobs:
                 gsTriggerDaemonInstantReload(q);
               }
               dispatch_async(dispatch_get_main_queue(), ^{
-                if (detectedCap != 0) self.jitterFlagSupport = detectedCap;
-                if (gen != self.applyGeneration) return;
+                __strong typeof(weakSelf) self = weakSelf;
+                if (!self || gen != self.applyGeneration) return;
                 if (rc == 0) {
                   self.cliKnownActive = YES;
                   [[[UINotificationFeedbackGenerator alloc] init] notificationOccurred:UINotificationFeedbackTypeSuccess];
@@ -3111,12 +3291,14 @@ jobs:
 
           - (void)stopSpoofTapped {
             [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium] impactOccurred];
+            self.userInteracted = YES;
             self.optimisticState = NO;
             self.optimisticUntil = CFAbsoluteTimeGetCurrent() + 4.0;
             [self refreshStatus];
 
             NSUInteger gen = ++self.applyGeneration;
             dispatch_queue_t q = self.cliQueue;
+            __weak typeof(self) weakSelf = self;
 
             dispatch_async(q, ^{
               NSString *out = nil;
@@ -3125,7 +3307,8 @@ jobs:
                 gsTriggerDaemonInstantReload(q);
               }
               dispatch_async(dispatch_get_main_queue(), ^{
-                if (gen != self.applyGeneration) return;
+                __strong typeof(weakSelf) self = weakSelf;
+                if (!self || gen != self.applyGeneration) return;
                 if (rc == 0) {
                   self.cliKnownActive = NO;
                   [[[UINotificationFeedbackGenerator alloc] init] notificationOccurred:UINotificationFeedbackTypeSuccess];
@@ -3141,9 +3324,17 @@ jobs:
           }
 
           - (void)showError:(NSString *)msg {
+            UIViewController *presenter = self;
+            while (presenter.presentedViewController && !presenter.presentedViewController.isBeingDismissed) {
+              presenter = presenter.presentedViewController;
+            }
+            if (presenter.isBeingDismissed || presenter.presentedViewController.isBeingDismissed) {
+              [self showToast:msg ?: @"Ошибка geoshim" color:UIColor.systemRedColor];
+              return;
+            }
             UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Ошибка geoshim" message:msg preferredStyle:UIAlertControllerStyleAlert];
             [ac addAction:[UIAlertAction actionWithTitle:@"ОК" style:UIAlertActionStyleDefault handler:nil]];
-            [self presentViewController:ac animated:YES completion:nil];
+            [presenter presentViewController:ac animated:YES completion:nil];
           }
 
           - (void)openFavorites {
@@ -3151,6 +3342,7 @@ jobs:
             fvc.currentCoord = self.selectedCoord;
             __weak typeof(self) weakSelf = self;
             fvc.onPick = ^(double lat, double lon) {
+              weakSelf.userInteracted = YES;
               [weakSelf movePinTo:CLLocationCoordinate2DMake(lat, lon) centerMap:YES zoom:15.5];
             };
             fvc.onFavoritesChanged = ^{
@@ -3174,9 +3366,10 @@ jobs:
             }];
             [ac addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
             [ac addAction:[UIAlertAction actionWithTitle:@"Сохранить" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+              (void)a;
               NSArray *saved = [NSUserDefaults.standardUserDefaults arrayForKey:kFavoritesKey];
               NSMutableArray *arr = saved ? [saved mutableCopy] : [NSMutableArray array];
-              NSString *name = [ac.textFields.firstObject.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+              NSString *name = gsStr(ac.textFields.firstObject.text);
               if (!name.length) name = [NSString stringWithFormat:@"Точка %lu", (unsigned long)(arr.count + 1)];
               [arr insertObject:@{@"name": name, @"lat": @(self.selectedCoord.latitude), @"lon": @(self.selectedCoord.longitude)} atIndex:0];
               [NSUserDefaults.standardUserDefaults setObject:arr forKey:kFavoritesKey];
@@ -3191,6 +3384,7 @@ jobs:
             NSString *clip = UIPasteboard.generalPasteboard.string ?: @"";
             CLLocationCoordinate2D parsed;
             if (gsParseCoordinateText(clip, &parsed)) {
+              self.userInteracted = YES;
               [self movePinTo:parsed centerMap:YES zoom:15.5];
               [[[UINotificationFeedbackGenerator alloc] init] notificationOccurred:UINotificationFeedbackTypeSuccess];
               [self showToast:@"📋 Координаты вставлены" color:UIColor.systemBlueColor];
@@ -3205,8 +3399,10 @@ jobs:
             }];
             [ac addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
             [ac addAction:[UIAlertAction actionWithTitle:@"Перейти" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+              (void)a;
               CLLocationCoordinate2D c;
               if (gsParseCoordinateText(ac.textFields.firstObject.text ?: @"", &c)) {
+                self.userInteracted = YES;
                 [self movePinTo:c centerMap:YES zoom:15.5];
               } else {
                 [self showError:@"Не удалось распознать координаты"];
@@ -3222,8 +3418,13 @@ jobs:
             if (!key.length || !results.count) return;
             self.searchCache[key] = @{@"ts": @([[NSDate date] timeIntervalSince1970]), @"results": results};
             if (self.searchCache.count > 40) {
-              NSArray<NSString *> *sortedKeys = [self.searchCache keysSortedByValueUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
-                return [a[@"ts"] compare:b[@"ts"]];
+              NSArray<NSString *> *sortedKeys = [self.searchCache keysSortedByValueUsingComparator:^NSComparisonResult(id a, id b) {
+                double ta = 0.0, tb = 0.0;
+                if ([a isKindOfClass:[NSDictionary class]]) gsDbl(((NSDictionary *)a)[@"ts"], &ta);
+                if ([b isKindOfClass:[NSDictionary class]]) gsDbl(((NSDictionary *)b)[@"ts"], &tb);
+                if (ta < tb) return NSOrderedAscending;
+                if (ta > tb) return NSOrderedDescending;
+                return NSOrderedSame;
               }];
               for (NSUInteger i = 0; i + 40 < sortedKeys.count; i++) {
                 [self.searchCache removeObjectForKey:sortedKeys[i]];
@@ -3237,7 +3438,8 @@ jobs:
             if (!key.length) return nil;
             NSDictionary *entry = self.searchCache[key];
             if (![entry isKindOfClass:[NSDictionary class]]) return nil;
-            NSTimeInterval ts = [entry[@"ts"] doubleValue];
+            double ts = 0.0;
+            if (!gsDbl(entry[@"ts"], &ts)) return nil;
             if ([[NSDate date] timeIntervalSince1970] - ts > 30.0 * 86400.0) return nil;
             NSArray *res = entry[@"results"];
             return ([res isKindOfClass:[NSArray class]] && res.count > 0) ? res : nil;
@@ -3248,23 +3450,32 @@ jobs:
             if (!norm.length) return [self.recentPlaces copy];
             NSMutableArray<NSDictionary *> *out = [NSMutableArray array];
             NSMutableSet<NSString *> *seen = [NSMutableSet set];
-            for (NSDictionary *p in self.recentPlaces) {
-              NSString *nm = [p[@"name"] isKindOfClass:[NSString class]] ? p[@"name"] : @"";
-              NSString *sb = [p[@"sub"] isKindOfClass:[NSString class]] ? p[@"sub"] : @"";
+            for (id pObj in self.recentPlaces) {
+              if (![pObj isKindOfClass:[NSDictionary class]]) continue;
+              NSDictionary *p = (NSDictionary *)pObj;
+              NSString *nm = gsStr(p[@"name"]) ?: @"";
+              NSString *sb = gsStr(p[@"sub"]) ?: @"";
+              double lat = 0.0, lon = 0.0;
+              if (!gsDbl(p[@"lat"], &lat) || !gsDbl(p[@"lon"], &lon)) continue;
               if ([nm.lowercaseString rangeOfString:norm].location != NSNotFound ||
                 [sb.lowercaseString rangeOfString:norm].location != NSNotFound) {
-                NSString *sig = [NSString stringWithFormat:@"%@:%.4f:%.4f", nm, [p[@"lat"] doubleValue], [p[@"lon"] doubleValue]];
+                NSString *sig = [NSString stringWithFormat:@"%@:%.4f:%.4f", nm, lat, lon];
                 if (![seen containsObject:sig]) { [seen addObject:sig]; [out addObject:p]; }
               }
               if (out.count >= 8) return out;
             }
             for (NSString *qKey in self.searchCache) {
               if ([qKey rangeOfString:norm].location == NSNotFound) continue;
-              NSArray *res = self.searchCache[qKey][@"results"];
-              if (![res isKindOfClass:[NSArray class]]) continue;
-              for (NSDictionary *p in res) {
-                NSString *nm = [p[@"name"] isKindOfClass:[NSString class]] ? p[@"name"] : @"";
-                NSString *sig = [NSString stringWithFormat:@"%@:%.4f:%.4f", nm, [p[@"lat"] doubleValue], [p[@"lon"] doubleValue]];
+              NSDictionary *entry = [self.searchCache[qKey] isKindOfClass:[NSDictionary class]] ? self.searchCache[qKey] : nil;
+              NSArray *res = [entry[@"results"] isKindOfClass:[NSArray class]] ? entry[@"results"] : nil;
+              if (!res) continue;
+              for (id pObj in res) {
+                if (![pObj isKindOfClass:[NSDictionary class]]) continue;
+                NSDictionary *p = (NSDictionary *)pObj;
+                NSString *nm = gsStr(p[@"name"]) ?: @"";
+                double lat = 0.0, lon = 0.0;
+                if (!gsDbl(p[@"lat"], &lat) || !gsDbl(p[@"lon"], &lon)) continue;
+                NSString *sig = [NSString stringWithFormat:@"%@:%.4f:%.4f", nm, lat, lon];
                 if (![seen containsObject:sig]) { [seen addObject:sig]; [out addObject:p]; }
                 if (out.count >= 8) return out;
               }
@@ -3274,13 +3485,16 @@ jobs:
 
           - (void)recordRecentPlace:(NSDictionary *)place {
             if (![place isKindOfClass:[NSDictionary class]]) return;
-            NSString *name = [place[@"name"] isKindOfClass:[NSString class]] ? place[@"name"] : @"Место";
-            NSString *sub = [place[@"sub"] isKindOfClass:[NSString class]] ? place[@"sub"] : @"";
-            double lat = [place[@"lat"] doubleValue], lon = [place[@"lon"] doubleValue];
+            NSString *name = gsStr(place[@"name"]) ?: @"Место";
+            NSString *sub = gsStr(place[@"sub"]) ?: @"";
+            double lat = 0.0, lon = 0.0;
+            if (!gsDbl(place[@"lat"], &lat) || !gsDbl(place[@"lon"], &lon)) return;
             NSDictionary *clean = @{@"name": name, @"sub": sub, @"lat": @(lat), @"lon": @(lon)};
             for (NSInteger i = (NSInteger)self.recentPlaces.count - 1; i >= 0; i--) {
-              NSDictionary *e = self.recentPlaces[(NSUInteger)i];
-              if ([e[@"name"] isEqualToString:name] && fabs([e[@"lat"] doubleValue] - lat) < 0.001 && fabs([e[@"lon"] doubleValue] - lon) < 0.001) {
+              NSDictionary *e = [self.recentPlaces[(NSUInteger)i] isKindOfClass:[NSDictionary class]] ? self.recentPlaces[(NSUInteger)i] : nil;
+              double elat = 0.0, elon = 0.0;
+              if (e && [gsStr(e[@"name"]) isEqualToString:name] && gsDbl(e[@"lat"], &elat) && gsDbl(e[@"lon"], &elon) &&
+                fabs(elat - lat) < 0.001 && fabs(elon - lon) < 0.001) {
                 [self.recentPlaces removeObjectAtIndex:(NSUInteger)i];
               }
             }
@@ -3302,10 +3516,12 @@ jobs:
 
           - (void)searchBarSearchButtonClicked:(UISearchBar *)searchBar {
             [searchBar resignFirstResponder];
+            [self cancelPendingSearch];
             NSString *q = [searchBar.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
             if (!q.length) { self.resultsTable.hidden = YES; return; }
             CLLocationCoordinate2D direct;
             if (gsParseCoordinateText(q, &direct)) {
+              self.userInteracted = YES;
               self.resultsTable.hidden = YES;
               [self movePinTo:direct centerMap:YES zoom:15.5];
               return;
@@ -3318,13 +3534,17 @@ jobs:
               return;
             }
             [self.searchSpinner startAnimating];
-            [self runPhotonSearch:q];
+            [self runPhotonSearch:q generation:self.searchGeneration];
           }
 
-          - (void)runPhotonSearch:(NSString *)q {
-            [self.searchTask cancel];
+          - (void)runPhotonSearch:(NSString *)q generation:(NSUInteger)gen {
             NSString *urlStr = [NSString stringWithFormat:@"https://photon.komoot.io/api/?q=%@&limit=8", gsEncodeQueryValue(q)];
-            NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlStr]];
+            NSURL *url = [NSURL URLWithString:urlStr];
+            if (!url) {
+              [self runNominatimSearch:q generation:gen];
+              return;
+            }
+            NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
             req.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
             [req setValue:kTileUA forHTTPHeaderField:@"User-Agent"];
             __weak typeof(self) weakSelf = self;
@@ -3333,26 +3553,32 @@ jobs:
               if (err && err.code == NSURLErrorCancelled) return;
               NSMutableArray *parsed = [NSMutableArray array];
               if (data.length && !err) {
-                NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-                NSArray *feats = [json isKindOfClass:[NSDictionary class]] ? json[@"features"] : nil;
-                for (NSDictionary *f in feats) {
-                  NSArray *coords = f[@"geometry"][@"coordinates"];
-                  NSDictionary *props = f[@"properties"];
-                  if ([coords isKindOfClass:[NSArray class]] && coords.count >= 2 && [props isKindOfClass:[NSDictionary class]]) {
-                    double lon = [coords[0] doubleValue], lat = [coords[1] doubleValue];
-                    NSString *name = props[@"name"] ?: props[@"street"] ?: props[@"city"] ?: @"Место";
-                    NSMutableArray *parts = [NSMutableArray array];
-                    if (props[@"street"]) [parts addObject:props[@"street"]];
-                    if (props[@"city"]) [parts addObject:props[@"city"]];
-                    if (props[@"state"]) [parts addObject:props[@"state"]];
-                    if (props[@"country"]) [parts addObject:props[@"country"]];
-                    [parsed addObject:@{@"name": name ?: @"Место", @"sub": [parts componentsJoinedByString:@", "] ?: @"", @"lat": @(lat), @"lon": @(lon)}];
+                id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                NSArray *feats = ([json isKindOfClass:[NSDictionary class]] && [((NSDictionary *)json)[@"features"] isKindOfClass:[NSArray class]])
+                         ? ((NSDictionary *)json)[@"features"] : nil;
+                for (id fObj in feats) {
+                  if (![fObj isKindOfClass:[NSDictionary class]]) continue;
+                  NSDictionary *f = (NSDictionary *)fObj;
+                  NSDictionary *geom = [f[@"geometry"] isKindOfClass:[NSDictionary class]] ? f[@"geometry"] : nil;
+                  NSArray *coords = [geom[@"coordinates"] isKindOfClass:[NSArray class]] ? geom[@"coordinates"] : nil;
+                  NSDictionary *props = [f[@"properties"] isKindOfClass:[NSDictionary class]] ? f[@"properties"] : nil;
+                  double lon = 0.0, lat = 0.0;
+                  if (coords.count >= 2 && props &&
+                    gsDbl(coords[0], &lon) && gsDbl(coords[1], &lat) &&
+                    fabs(lat) <= 90.0 && fabs(lon) <= 180.0) {
+                    NSString *name = gsStr(props[@"name"]) ?: gsStr(props[@"street"]) ?: gsStr(props[@"city"]) ?: @"Место";
+                    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+                    NSString *s1 = gsStr(props[@"street"]);  if (s1) [parts addObject:s1];
+                    NSString *s2 = gsStr(props[@"city"]);    if (s2) [parts addObject:s2];
+                    NSString *s3 = gsStr(props[@"state"]);   if (s3) [parts addObject:s3];
+                    NSString *s4 = gsStr(props[@"country"]); if (s4) [parts addObject:s4];
+                    [parsed addObject:@{@"name": name, @"sub": [parts componentsJoinedByString:@", "] ?: @"", @"lat": @(lat), @"lon": @(lon)}];
                   }
                 }
               }
               dispatch_async(dispatch_get_main_queue(), ^{
                 __strong typeof(weakSelf) self = weakSelf;
-                if (!self) return;
+                if (!self || gen != self.searchGeneration) return;
                 if (parsed.count > 0) {
                   [self.searchSpinner stopAnimating];
                   [self cacheSearchResults:parsed forQuery:q];
@@ -3360,16 +3586,22 @@ jobs:
                   [self.resultsTable reloadData];
                   self.resultsTable.hidden = NO;
                 } else {
-                  [self runNominatimSearch:q];
+                  [self runNominatimSearch:q generation:gen];
                 }
               });
             }];
             [self.searchTask resume];
           }
 
-          - (void)runNominatimSearch:(NSString *)q {
+          - (void)runNominatimSearch:(NSString *)q generation:(NSUInteger)gen {
             NSString *urlStr = [NSString stringWithFormat:@"https://nominatim.openstreetmap.org/search?format=json&limit=8&q=%@", gsEncodeQueryValue(q)];
-            NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlStr]];
+            NSURL *url = [NSURL URLWithString:urlStr];
+            if (!url) {
+              [self.searchSpinner stopAnimating];
+              [self showToast:@"Ничего не найдено" color:UIColor.systemOrangeColor];
+              return;
+            }
+            NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
             req.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
             [req setValue:kTileUA forHTTPHeaderField:@"User-Agent"];
             __weak typeof(self) weakSelf = self;
@@ -3378,20 +3610,24 @@ jobs:
               if (err && err.code == NSURLErrorCancelled) return;
               NSMutableArray *parsed = [NSMutableArray array];
               if (data.length && !err) {
-                NSArray *arr = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                id arr = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
                 if ([arr isKindOfClass:[NSArray class]]) {
-                  for (NSDictionary *d in arr) {
-                    if (![d isKindOfClass:[NSDictionary class]]) continue;
-                    NSString *disp = d[@"display_name"] ?: @"Место";
+                  for (id dObj in (NSArray *)arr) {
+                    if (![dObj isKindOfClass:[NSDictionary class]]) continue;
+                    NSDictionary *d = (NSDictionary *)dObj;
+                    double lat = 0.0, lon = 0.0;
+                    if (!gsDbl(d[@"lat"], &lat) || !gsDbl(d[@"lon"], &lon) ||
+                      fabs(lat) > 90.0 || fabs(lon) > 180.0) continue;
+                    NSString *disp = gsStr(d[@"display_name"]) ?: @"Место";
                     NSArray *parts = [disp componentsSeparatedByString:@","];
-                    NSString *name = parts.firstObject ?: disp;
-                    [parsed addObject:@{@"name": name ?: @"Место", @"sub": disp ?: @"", @"lat": @([d[@"lat"] doubleValue]), @"lon": @([d[@"lon"] doubleValue])}];
+                    NSString *name = gsStr(parts.firstObject) ?: disp;
+                    [parsed addObject:@{@"name": name, @"sub": disp, @"lat": @(lat), @"lon": @(lon)}];
                   }
                 }
               }
               dispatch_async(dispatch_get_main_queue(), ^{
                 __strong typeof(weakSelf) self = weakSelf;
-                if (!self) return;
+                if (!self || gen != self.searchGeneration) return;
                 [self.searchSpinner stopAnimating];
                 if (parsed.count > 0) [self cacheSearchResults:parsed forQuery:q];
                 self.searchResults = parsed;
@@ -3425,9 +3661,9 @@ jobs:
             UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"res"];
             if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"res"];
             if ((NSUInteger)indexPath.row >= self.searchResults.count) return cell;
-            NSDictionary *d = self.searchResults[indexPath.row];
-            cell.textLabel.text = d[@"name"];
-            cell.detailTextLabel.text = d[@"sub"];
+            NSDictionary *d = [self.searchResults[indexPath.row] isKindOfClass:[NSDictionary class]] ? self.searchResults[indexPath.row] : @{};
+            cell.textLabel.text = gsStr(d[@"name"]) ?: @"Место";
+            cell.detailTextLabel.text = gsStr(d[@"sub"]) ?: @"";
             cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
             cell.backgroundColor = UIColor.clearColor;
             return cell;
@@ -3436,11 +3672,16 @@ jobs:
           - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
             [tableView deselectRowAtIndexPath:indexPath animated:YES];
             if ((NSUInteger)indexPath.row >= self.searchResults.count) return;
-            NSDictionary *d = self.searchResults[indexPath.row];
+            NSDictionary *d = [self.searchResults[indexPath.row] isKindOfClass:[NSDictionary class]] ? self.searchResults[indexPath.row] : nil;
+            double lat = 0.0, lon = 0.0;
+            if (!d || !gsDbl(d[@"lat"], &lat) || !gsDbl(d[@"lon"], &lon)) return;
+            self.userInteracted = YES;
+            [self cancelPendingSearch];
             [self recordRecentPlace:d];
+            self.searchBar.text = gsStr(d[@"name"]) ?: @"";
             self.resultsTable.hidden = YES;
             [self.searchBar resignFirstResponder];
-            [self movePinTo:CLLocationCoordinate2DMake([d[@"lat"] doubleValue], [d[@"lon"] doubleValue]) centerMap:YES zoom:15.5];
+            [self movePinTo:CLLocationCoordinate2DMake(lat, lon) centerMap:YES zoom:15.5];
           }
 
           @end
@@ -3524,8 +3765,12 @@ jobs:
           assert plistlib.load(open("GeoShim.plist", "rb")) == {"Filter": {"Executables": ["locationd"]}}
           assert "regulad.geoshim.target" in open("Tweak.x").read()
           assert "regulad.geoshim.reload" in open("Tweak.x").read()
+          assert "GS_FAKE_TOL_LAT" in open("Tweak.x").read()
+          assert "gs_pair_load" in open("Tweak.x").read()
           assert "regulad.geoshim.reload" in open("app/MapViewController.m").read()
           assert "GSDisplayLinkProxy" in open("app/MapViewController.m").read()
+          assert "pinchEndedTs" in open("app/MapViewController.m").read()
+          assert "GeoShimApp/1.3.1" in open("app/MapViewController.m").read()
           assert "tile.openstreetmap.org" in open("app/MapViewController.m").read()
           assert "cartocdn" not in open("app/MapViewController.m").read()
           print("patch ok")
@@ -3541,7 +3786,7 @@ jobs:
           tar -xf /tmp/sdk.tar.xz -C "$HOME/theos/sdks"
           ls "$HOME/theos/sdks"
 
-      - name: Build .deb (release v1.3 + GeoShimApp v1.3)
+      - name: Build .deb (release v1.3.1 + GeoShimApp v1.3.1)
         run: |
           export THEOS="$HOME/theos"
           make package FINALPACKAGE=1 ARCHS=arm64e
@@ -3576,6 +3821,8 @@ jobs:
           strings /tmp/debx/Library/MobileSubstrate/DynamicLibraries/GeoShim.dylib | grep -q "regulad.geoshim.reload" || { echo "reload notify missing in dylib"; exit 1; }
           strings /tmp/debx/usr/local/bin/geoshim | grep -q "dmach_in=" || { echo "xpc release output missing in cli"; exit 1; }
           strings /tmp/debx/Applications/GeoShimApp.app/GeoShimApp | grep -q "tile.openstreetmap.org" || { echo "OSM tile engine missing in app"; exit 1; }
+          strings /tmp/debx/Applications/GeoShimApp.app/GeoShimApp | grep -q "GeoShimApp/1.3.1" || { echo "v1.3.1 UA missing in app"; exit 1; }
+          grep -q "<string>1.3.1</string>" /tmp/debx/Applications/GeoShimApp.app/Info.plist || { echo "v1.3.1 Info.plist version missing"; exit 1; }
           [ -f /tmp/debx/Applications/GeoShimApp.app/AppIcon60x60@3x.png ] || { echo "AppIcon missing"; exit 1; }
           ldid -e /tmp/debx/Applications/GeoShimApp.app/GeoShimApp | grep -q "no-sandbox" || { echo "entitlements missing on GeoShimApp"; exit 1; }
           dpkg-deb -I "$DEB" postinst | grep -q "uicache" || { echo "postinst uicache missing"; exit 1; }
@@ -3590,7 +3837,7 @@ jobs:
 
   publish:
     needs: build
-    if: always()
+    if: ${{ !cancelled() && needs.build.result != 'cancelled' }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/download-artifact@v4
@@ -3607,8 +3854,8 @@ jobs:
           find dist -type f -ls
           DEB=$(find dist -name '*.deb' | sort | head -n 1)
           if [ -z "$DEB" ]; then echo "no .deb produced"; exit 1; fi
-          rm -rf /tmp/pubcheck && dpkg-deb -x "$DEB" /tmp/pubcheck
           cp "$DEB" dist/geoshim-latest.deb
+          rm -rf /tmp/pubcheck && dpkg-deb -x dist/geoshim-latest.deb /tmp/pubcheck
           gh release view latest-build >/dev/null 2>&1 || \
             gh release create latest-build --title "GeoShim latest build" --notes "Automated build ${GITHUB_SHA}"
           gh release upload latest-build dist/geoshim-latest.deb --clobber
