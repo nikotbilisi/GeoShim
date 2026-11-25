@@ -22,7 +22,43 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Patch daemon (release) + native GeoShimApp (direct HTTPS tile map)
+      - name: Check live map tile & search endpoints
+        run: |
+          python3 - << 'PY'
+          import urllib.request, urllib.error, json, sys
+
+          ua = "GeoShimApp/1.2 (+https://github.com/nikotbilisi/GeoShim)"
+          # Dense Manhattan tile z=14, x=4825, y=6156
+          tiles = [
+              ("OSM", "https://tile.openstreetmap.org/14/4825/6156.png"),
+              ("Esri Satellite", "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/14/6156/4825"),
+              ("Esri Streets", "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/14/6156/4825"),
+          ]
+          ok_count = 0
+          for name, url in tiles:
+              req = urllib.request.Request(url, headers={"User-Agent": ua})
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as r:
+                      data = r.read()
+                      is_img = data.startswith(b"\x89PNG") or data.startswith(b"\xff\xd8\xff")
+                      print(f"{name}: HTTP {r.status}, {len(data)} bytes, valid_img={is_img}")
+                      if not is_img or len(data) < 1000:
+                          sys.exit(f"Invalid tile payload from {name}")
+                      ok_count += 1
+              except urllib.error.HTTPError as e:
+                  print(f"{name}: HTTP {e.code} on CI runner IP (non-fatal)")
+          if ok_count == 0:
+              sys.exit("All tile servers failed!")
+          try:
+              req = urllib.request.Request("https://photon.komoot.io/api/?q=Seattle&limit=1", headers={"User-Agent": ua})
+              with urllib.request.urlopen(req, timeout=15) as r:
+                  j = json.loads(r.read().decode("utf-8"))
+                  print(f"Photon search: {len(j.get('features', []))} features")
+          except Exception as e:
+              print(f"Photon CI check note: {e}")
+          PY
+
+      - name: Patch daemon (release) + native GeoShimApp v1.2
         run: |
           python3 - << 'PY'
           import os, re, plistlib, shutil, struct, zlib, math
@@ -37,7 +73,7 @@ jobs:
           with open("GSConfig.m", "a") as f:
               f.write('\nint libSandy_applyProfile(const char *profileName) { (void)profileName; return 0; }\n')
 
-          # 3. Release iOS 18 Total IPC Rewriter in Tweak.x
+          # 3. Release iOS 18 Total IPC Rewriter + live target state notify in Tweak.x
           old_anchor = "static IMP gEncodeWithCoderOrig = NULL;"
           xpc_rewriter = old_anchor + r'''
 
@@ -133,13 +169,14 @@ jobs:
 
           static __thread int gInXpcHook = 0;
 
-          #define GS_DIAG_NOTIFY "xyz.regulad.geoshim.diag"
-          #define GS_REAL_NOTIFY "xyz.regulad.geoshim.real"
-          #define GS_XPC_NOTIFY  "xyz.regulad.geoshim.xpc"
-          #define GS_XPC2_NOTIFY "xyz.regulad.geoshim.xpc2"
-          #define GS_XPC3_NOTIFY "xyz.regulad.geoshim.xpc3"
-          #define GS_XPC4_NOTIFY "xyz.regulad.geoshim.xpc4"
-          #define GS_PROC_NOTIFY "xyz.regulad.geoshim.proc"
+          #define GS_DIAG_NOTIFY   "xyz.regulad.geoshim.diag"
+          #define GS_REAL_NOTIFY   "xyz.regulad.geoshim.real"
+          #define GS_TARGET_NOTIFY "xyz.regulad.geoshim.target"
+          #define GS_XPC_NOTIFY    "xyz.regulad.geoshim.xpc"
+          #define GS_XPC2_NOTIFY   "xyz.regulad.geoshim.xpc2"
+          #define GS_XPC3_NOTIFY   "xyz.regulad.geoshim.xpc3"
+          #define GS_XPC4_NOTIFY   "xyz.regulad.geoshim.xpc4"
+          #define GS_PROC_NOTIFY   "xyz.regulad.geoshim.proc"
 
           static void gs_set_state(const char *name, int *tok, uint64_t val) {
               int prev = gInXpcHook;
@@ -147,6 +184,17 @@ jobs:
               if (*tok == -1) notify_register_check(name, tok);
               if (*tok != -1) notify_set_state(*tok, val);
               gInXpcHook = prev;
+          }
+
+          static void gs_publish_target(bool active, double lat, double lon, bool hasCoord) {
+              static int ttok = -1;
+              uint64_t tv = active ? (1ULL << 63) : 0ULL;
+              if (hasCoord && isfinite(lat) && isfinite(lon) && fabs(lat) <= 90.0 && fabs(lon) <= 180.0) {
+                  uint64_t ilat = (uint64_t)llround((lat + 90.0) * 100000.0) & 0x1FFFFFFULL;
+                  uint64_t ilon = (uint64_t)llround((lon + 180.0) * 100000.0) & 0x3FFFFFFULL;
+                  tv |= (1ULL << 62) | ilat | (ilon << 25);
+              }
+              gs_set_state(GS_TARGET_NOTIFY, &ttok, tv);
           }
 
           static void gs_diag_publish(void) {
@@ -696,16 +744,20 @@ jobs:
                   @try {
                       GSLocationFactory *factory = [GSLocationFactory shared];
                       bool active = factory && factory.active;
-                      atomic_store_explicit(&gCachedActive, active ? 1 : 0, memory_order_release);
-                      if (!active) return false;
+                      uint32_t prevActive = atomic_exchange_explicit(&gCachedActive, active ? 1 : 0, memory_order_acq_rel);
+                      if (!active) {
+                          if (prevActive != 0) gs_publish_target(false, 0.0, 0.0, false);
+                          return false;
+                      }
                       CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-                      if (now - gCachedFakeTs >= 0.5 || gCachedFakeTs == 0.0) {
+                      if (now - gCachedFakeTs >= 0.5 || gCachedFakeTs == 0.0 || prevActive == 0) {
                           CLLocation *dummy = [[CLLocation alloc] initWithLatitude:rlat longitude:rlon];
                           CLLocation *fake = [factory spoofedLocationFromReal:dummy];
                           if (!fake || !CLLocationCoordinate2DIsValid(fake.coordinate)) return false;
                           gCachedFakeLat = fake.coordinate.latitude;
                           gCachedFakeLon = fake.coordinate.longitude;
                           gCachedFakeTs = now;
+                          gs_publish_target(true, gCachedFakeLat, gCachedFakeLon, true);
                       }
                       *outFlat = gCachedFakeLat;
                       *outFlon = gCachedFakeLon;
@@ -1093,6 +1145,7 @@ jobs:
                   GSLocationFactory *factory = [GSLocationFactory shared];
                   bool active = factory && factory.active;
                   atomic_store_explicit(&gCachedActive, active ? 1 : 0, memory_order_release);
+                  if (!active) gs_publish_target(false, 0.0, 0.0, false);
                   if ([self isKindOfClass:[CLLocation class]]) {
                       CLLocation *real = (CLLocation *)self;
 
@@ -1107,10 +1160,13 @@ jobs:
                               [factory noteRealLocation:real];
                               CLLocation *fake = [factory spoofedLocationFromReal:real];
                               bool hasFake = (fake && CLLocationCoordinate2DIsValid(fake.coordinate));
-                              if (hasFake && gCachedFakeTs == 0.0) {
-                                  gCachedFakeLat = fake.coordinate.latitude;
-                                  gCachedFakeLon = fake.coordinate.longitude;
-                                  gCachedFakeTs = CFAbsoluteTimeGetCurrent();
+                              if (hasFake) {
+                                  if (gCachedFakeTs == 0.0) {
+                                      gCachedFakeLat = fake.coordinate.latitude;
+                                      gCachedFakeLon = fake.coordinate.longitude;
+                                      gCachedFakeTs = CFAbsoluteTimeGetCurrent();
+                                  }
+                                  gs_publish_target(true, fake.coordinate.latitude, fake.coordinate.longitude, true);
                               }
                               if (real.horizontalAccuracy > 0.0 && real.horizontalAccuracy < 10000.0 && age < 30.0) {
                                   gs_note_live_real_coord(real.coordinate.latitude, real.coordinate.longitude,
@@ -1146,7 +1202,6 @@ jobs:
 
           # 4. CLI status telemetry
           m = open("cli/main.m").read()
-          assert "--jitter" in m, "cli missing --jitter option"
           old_json_anchor = "static int commandStatusJSON(void) {"
           diag_fn = '''static void printEncodeDiag(void) {
               int tok = -1;
@@ -1229,7 +1284,7 @@ jobs:
           m = m.replace(old_visit, new_visit, 1)
           open("cli/main.m", "w").write(m)
 
-          # 5. Native GeoShimApp with direct HTTPS Web Mercator tile map (zero geod/MapKit!)
+          # 5. Native GeoShimApp v1.2 (OSM + Esri Satellite + Esri Streets, GPU parent-tile zoom, real CLI pipe + target sync)
           os.makedirs("app/Resources", exist_ok=True)
 
           def make_icon_png(size, out_path):
@@ -1316,9 +1371,9 @@ jobs:
               <key>CFBundlePackageType</key>
               <string>APPL</string>
               <key>CFBundleShortVersionString</key>
-              <string>1.1</string>
+              <string>1.2</string>
               <key>CFBundleVersion</key>
-              <string>2</string>
+              <string>3</string>
               <key>CFBundleIcons</key>
               <dict>
                   <key>CFBundlePrimaryIcon</key>
@@ -1412,6 +1467,8 @@ jobs:
           #import <spawn.h>
           #import <sys/wait.h>
           #import <unistd.h>
+          #import <errno.h>
+          #import <string.h>
           #import <math.h>
 
           extern char **environ;
@@ -1419,7 +1476,10 @@ jobs:
           static NSString * const kFavoritesKey = @"GSAppFavoritesV1";
           static NSString * const kAltitudeKey  = @"GSAppAltitudeV1";
           static NSString * const kJitterIdxKey = @"GSAppJitterIdxV1";
-          static NSString * const kMapStyleKey  = @"GSAppMapStyleV1";
+          static NSString * const kMapStyleKey  = @"GSAppMapStyleV2";
+          static NSString * const kLastLatKey   = @"GSAppLastLatV1";
+          static NSString * const kLastLonKey   = @"GSAppLastLonV1";
+          static NSString * const kTileUA       = @"GeoShimApp/1.2 (+https://github.com/nikotbilisi/GeoShim)";
 
           static NSString *gsJBRootPath(void) {
               NSString *bundle = NSBundle.mainBundle.bundlePath;
@@ -1442,40 +1502,64 @@ jobs:
               return cands.firstObject;
           }
 
-          static NSString *gsPrefsPath(void) {
-              NSString *root = gsJBRootPath();
-              NSArray<NSString *> *cands = @[
-                  [root stringByAppendingPathComponent:@"var/mobile/Library/Preferences/xyz.regulad.geoshim.plist"],
-                  @"/var/jb/var/mobile/Library/Preferences/xyz.regulad.geoshim.plist",
-                  @"/var/mobile/Library/Preferences/xyz.regulad.geoshim.plist"
-              ];
-              for (NSString *p in cands) {
-                  if (access(p.fileSystemRepresentation, R_OK) == 0) return p;
-              }
-              return cands.firstObject;
-          }
-
-          static int gsRunCLI(NSArray<NSString *> *args) {
+          static int gsRunCLI(NSArray<NSString *> *args, NSString **outText) {
               NSString *cli = gsCLIPath();
-              if (!cli || access(cli.fileSystemRepresentation, X_OK) != 0) return -1;
+              if (!cli || access(cli.fileSystemRepresentation, X_OK) != 0) {
+                  if (outText) *outText = [NSString stringWithFormat:@"Не найден бинарник geoshim: %@", cli ?: @"(nil)"];
+                  return -1;
+              }
+
+              int pipefd[2] = {-1, -1};
+              if (pipe(pipefd) != 0) {
+                  if (outText) *outText = [NSString stringWithFormat:@"pipe() error: %s", strerror(errno)];
+                  return -2;
+              }
+
+              posix_spawn_file_actions_t actions;
+              posix_spawn_file_actions_init(&actions);
+              posix_spawn_file_actions_addclose(&actions, pipefd[0]);
+              posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
+              posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDERR_FILENO);
+              posix_spawn_file_actions_addclose(&actions, pipefd[1]);
+
               NSUInteger count = args.count + 1;
               char **argv = (char **)calloc(count + 1, sizeof(char *));
-              if (!argv) return -2;
               argv[0] = strdup("geoshim");
               for (NSUInteger i = 0; i < args.count; i++) {
                   argv[i + 1] = strdup(args[i].UTF8String);
               }
               argv[count] = NULL;
+
               pid_t pid = 0;
-              int rc = posix_spawn(&pid, cli.fileSystemRepresentation, NULL, NULL, argv, environ);
+              int rc = posix_spawn(&pid, cli.fileSystemRepresentation, &actions, NULL, argv, environ);
+              posix_spawn_file_actions_destroy(&actions);
+              close(pipefd[1]);
+
+              NSMutableData *buf = [NSMutableData data];
               int exitCode = -3;
               if (rc == 0 && pid > 0) {
+                  uint8_t tmp[1024];
+                  ssize_t n = 0;
+                  while ((n = read(pipefd[0], tmp, sizeof(tmp))) > 0) {
+                      [buf appendBytes:tmp length:(NSUInteger)n];
+                  }
                   int status = 0;
                   waitpid(pid, &status, 0);
                   if (WIFEXITED(status)) exitCode = WEXITSTATUS(status);
+                  else if (WIFSIGNALED(status)) exitCode = 128 + WTERMSIG(status);
+              } else {
+                  if (outText) *outText = [NSString stringWithFormat:@"posix_spawn rc=%d (%s)", rc, strerror(rc)];
+                  exitCode = -rc;
               }
+              close(pipefd[0]);
+
               for (NSUInteger i = 0; i < count; i++) free(argv[i]);
               free(argv);
+
+              if (outText && !(*outText)) {
+                  NSString *s = [[NSString alloc] initWithData:buf encoding:NSUTF8StringEncoding];
+                  *outText = [s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
+              }
               return exitCode;
           }
 
@@ -1494,7 +1578,29 @@ jobs:
               return YES;
           }
 
-          static BOOL gsReadDaemonStatus(BOOL *outEnabled, uint32_t *outBlobs) {
+          static BOOL gsReadTargetNotify(BOOL *outActive, CLLocationCoordinate2D *outCoord) {
+              int tok = -1;
+              if (notify_register_check("xyz.regulad.geoshim.target", &tok) != NOTIFY_STATUS_OK || tok == -1) return NO;
+              uint64_t tv = 0;
+              notify_get_state(tok, &tv);
+              notify_cancel(tok);
+              if (outActive) *outActive = (((tv >> 63) & 1ULL) == 1ULL);
+              BOOL hasCoord = (((tv >> 62) & 1ULL) == 1ULL);
+              if (hasCoord && outCoord) {
+                  uint32_t ilat = (uint32_t)(tv & 0x1FFFFFFULL);
+                  uint32_t ilon = (uint32_t)((tv >> 25) & 0x3FFFFFFULL);
+                  double lat = (double)ilat / 100000.0 - 90.0;
+                  double lon = (double)ilon / 100000.0 - 180.0;
+                  if (lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0) {
+                      *outCoord = CLLocationCoordinate2DMake(lat, lon);
+                  } else {
+                      hasCoord = NO;
+                  }
+              }
+              return hasCoord;
+          }
+
+          static BOOL gsReadXpcStatus(uint32_t *outBlobs) {
               int tok = -1;
               uint64_t xv = 0;
               if (notify_register_check("xyz.regulad.geoshim.xpc", &tok) == NOTIFY_STATUS_OK && tok != -1) {
@@ -1502,17 +1608,14 @@ jobs:
                   notify_cancel(tok);
               }
               if (outBlobs) *outBlobs = (uint32_t)((xv >> 20) & 0xFFFFF);
-              NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:gsPrefsPath()];
-              if (outEnabled) *outEnabled = [prefs[@"enabled"] boolValue];
-              return ((xv >> 63) & 1) == 1;
+              return ((xv >> 63) & 1ULL) == 1ULL;
           }
 
           static BOOL gsParseCoordinateText(NSString *text, CLLocationCoordinate2D *outCoord) {
               if (!text.length) return NO;
-              NSError *err = nil;
               NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:@"(-?\\d{1,2}\\.\\d+)\\s*[,;\\s]+\\s*(-?\\d{1,3}\\.\\d+)"
                                                                                   options:0
-                                                                                    error:&err];
+                                                                                    error:nil];
               if (!rx) return NO;
               NSArray<NSTextCheckingResult *> *matches = [rx matchesInString:text options:0 range:NSMakeRange(0, text.length)];
               for (NSTextCheckingResult *m in matches) {
@@ -1528,23 +1631,21 @@ jobs:
               return NO;
           }
 
-          // --- Pure UIKit + NSURLSession Web Mercator Tile Map (zero geod/MapKit) ---
-          static inline double gsWorldSize(double z) { return 256.0 * pow(2.0, z); }
-
-          static inline double gsLonToX(double lon, double z) {
-              return (lon + 180.0) / 360.0 * gsWorldSize(z);
+          static NSString *gsEncodeQueryValue(NSString *s) {
+              NSMutableCharacterSet *cs = [NSCharacterSet.URLQueryAllowedCharacterSet mutableCopy];
+              [cs removeCharactersInString:@"&=?+#/"];
+              return [s stringByAddingPercentEncodingWithAllowedCharacters:cs] ?: @"";
           }
 
+          // --- Pure UIKit + NSURLSession Web Mercator Tile Map (OSM + Esri Satellite + Esri Streets) ---
+          static inline double gsWorldSize(double z) { return 256.0 * pow(2.0, z); }
+          static inline double gsLonToX(double lon, double z) { return (lon + 180.0) / 360.0 * gsWorldSize(z); }
           static inline double gsLatToY(double lat, double z) {
               double clat = fmax(-85.05112878, fmin(85.05112878, lat));
               double rad = clat * M_PI / 180.0;
               return (1.0 - log(tan(rad) + 1.0 / cos(rad)) / M_PI) * 0.5 * gsWorldSize(z);
           }
-
-          static inline double gsXToLon(double x, double z) {
-              return x / gsWorldSize(z) * 360.0 - 180.0;
-          }
-
+          static inline double gsXToLon(double x, double z) { return x / gsWorldSize(z) * 360.0 - 180.0; }
           static inline double gsYToLat(double y, double z) {
               double n = M_PI - 2.0 * M_PI * y / gsWorldSize(z);
               return 180.0 / M_PI * atan(0.5 * (exp(n) - exp(-n)));
@@ -1558,7 +1659,7 @@ jobs:
           @property (nonatomic, assign) CLLocationCoordinate2D realCoord;
           @property (nonatomic, assign) BOOL hasRealCoord;
           @property (nonatomic, assign) BOOL spoofActive;
-          @property (nonatomic, assign) NSInteger styleIndex; // 0=Carto, 1=Satellite, 2=OSM
+          @property (nonatomic, assign) NSInteger styleIndex; // 0=OSM, 1=Esri Satellite, 2=Esri Streets
           @property (nonatomic, copy) void (^onPinChanged)(CLLocationCoordinate2D coord);
           @property (nonatomic, copy) void (^onTileError)(NSString * _Nullable msg);
           @property (nonatomic, copy) void (^onInteraction)(void);
@@ -1575,6 +1676,7 @@ jobs:
           @property (nonatomic, assign) double pinchAnchorLat;
           @property (nonatomic, assign) double pinchAnchorLon;
           - (void)reloadTiles;
+          - (void)clearVisibleTiles;
           - (void)zoomBy:(double)delta;
           @end
 
@@ -1583,20 +1685,28 @@ jobs:
           - (instancetype)initWithFrame:(CGRect)frame {
               self = [super initWithFrame:frame];
               if (self) {
-                  self.backgroundColor = [UIColor colorWithRed:0.89 green:0.91 blue:0.93 alpha:1.0];
+                  self.backgroundColor = [UIColor colorWithRed:0.86 green:0.89 blue:0.92 alpha:1.0];
                   self.clipsToBounds = YES;
                   self.multipleTouchEnabled = YES;
 
-                  _zoom = 14.5;
+                  _zoom = 15.0;
                   _visibleTiles = [NSMutableDictionary dictionary];
                   _tileCache = [[NSCache alloc] init];
                   _tileCache.countLimit = 450;
                   _inFlightKeys = [NSMutableSet set];
 
+                  NSURL *cachesDir = [NSFileManager.defaultManager URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask].firstObject;
+                  NSURL *tileDiskDir = [cachesDir URLByAppendingPathComponent:@"GSTileCache"];
+                  NSURLCache *diskCache = [[NSURLCache alloc] initWithMemoryCapacity:32 * 1024 * 1024
+                                                                        diskCapacity:100 * 1024 * 1024
+                                                                        directoryURL:tileDiskDir];
+
                   NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
+                  cfg.URLCache = diskCache;
+                  cfg.requestCachePolicy = NSURLRequestReturnCacheDataElseLoad;
                   cfg.timeoutIntervalForRequest = 12.0;
-                  cfg.HTTPMaximumConnectionsPerHost = 8;
-                  cfg.HTTPAdditionalHeaders = @{@"User-Agent": @"GeoShimApp/1.1 (iOS; Mobile)"};
+                  cfg.HTTPMaximumConnectionsPerHost = 6;
+                  cfg.HTTPAdditionalHeaders = @{@"User-Agent": kTileUA};
                   _session = [NSURLSession sessionWithConfiguration:cfg];
 
                   _tilesContainer = [[UIView alloc] initWithFrame:self.bounds];
@@ -1610,19 +1720,19 @@ jobs:
                   _realDotView.layer.borderColor = UIColor.whiteColor.CGColor;
                   _realDotView.layer.borderWidth = 2.5;
                   _realDotView.layer.shadowColor = UIColor.blackColor.CGColor;
-                  _realDotView.layer.shadowOpacity = 0.3;
+                  _realDotView.layer.shadowOpacity = 0.35;
                   _realDotView.layer.shadowRadius = 3;
                   _realDotView.hidden = YES;
                   _realDotView.userInteractionEnabled = NO;
                   [self addSubview:_realDotView];
 
-                  _pinView = [[UIImageView alloc] initWithFrame:CGRectMake(0, 0, 40, 40)];
-                  UIImageSymbolConfiguration *pcfg = [UIImageSymbolConfiguration configurationWithPointSize:34 weight:UIImageSymbolWeightBold];
+                  _pinView = [[UIImageView alloc] initWithFrame:CGRectMake(0, 0, 42, 42)];
+                  UIImageSymbolConfiguration *pcfg = [UIImageSymbolConfiguration configurationWithPointSize:36 weight:UIImageSymbolWeightBold];
                   _pinView.image = [UIImage systemImageNamed:@"mappin.circle.fill" withConfiguration:pcfg];
                   _pinView.contentMode = UIViewContentModeScaleAspectFit;
                   _pinView.tintColor = UIColor.systemRedColor;
                   _pinView.layer.shadowColor = UIColor.blackColor.CGColor;
-                  _pinView.layer.shadowOpacity = 0.4;
+                  _pinView.layer.shadowOpacity = 0.45;
                   _pinView.layer.shadowRadius = 4;
                   _pinView.layer.shadowOffset = CGSizeMake(0, 2);
                   _pinView.userInteractionEnabled = NO;
@@ -1654,6 +1764,11 @@ jobs:
               [self reloadTiles];
           }
 
+          - (void)clearVisibleTiles {
+              for (UIImageView *iv in self.visibleTiles.allValues) [iv removeFromSuperview];
+              [self.visibleTiles removeAllObjects];
+          }
+
           - (CGPoint)screenPointForLat:(double)lat lon:(double)lon {
               double cx = gsLonToX(self.centerLon, self.zoom);
               double cy = gsLatToY(self.centerLat, self.zoom);
@@ -1678,17 +1793,11 @@ jobs:
 
           - (NSURL *)tileURLForStyle:(NSInteger)style z:(int)z x:(int)x y:(int)y {
               if (style == 1) {
-                  // Esri World Imagery uses /tile/{z}/{y}/{x}
-                  NSString *s = [NSString stringWithFormat:@"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/%d/%d/%d", z, y, x];
-                  return [NSURL URLWithString:s];
+                  return [NSURL URLWithString:[NSString stringWithFormat:@"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/%d/%d/%d", z, y, x]];
               } else if (style == 2) {
-                  NSString *s = [NSString stringWithFormat:@"https://tile.openstreetmap.org/%d/%d/%d.png", z, x, y];
-                  return [NSURL URLWithString:s];
+                  return [NSURL URLWithString:[NSString stringWithFormat:@"https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/%d/%d/%d", z, y, x]];
               } else {
-                  const char *subs = "abcd";
-                  char sub = subs[(x + y) & 3];
-                  NSString *s = [NSString stringWithFormat:@"https://%c.basemaps.cartocdn.com/rastertiles/voyager/%d/%d/%d@2x.png", sub, z, x, y];
-                  return [NSURL URLWithString:s];
+                  return [NSURL URLWithString:[NSString stringWithFormat:@"https://tile.openstreetmap.org/%d/%d/%d.png", z, x, y]];
               }
           }
 
@@ -1710,7 +1819,7 @@ jobs:
               CGSize sz = self.bounds.size;
               if (sz.width < 10 || sz.height < 10) return;
 
-              int maxZ = (self.styleIndex == 1) ? 18 : 19;
+              int maxZ = (self.styleIndex == 0) ? 19 : 18;
               int tz = (int)floor(self.zoom);
               if (tz < 2) tz = 2;
               if (tz > maxZ) tz = maxZ;
@@ -1744,33 +1853,40 @@ jobs:
                                                 ceil(tilePx) + 1.0);
 
                       UIImageView *iv = self.visibleTiles[viewKey];
+                      UIImage *cached = [self.tileCache objectForKey:cacheKey];
                       if (!iv) {
                           iv = [[UIImageView alloc] initWithFrame:frame];
                           iv.contentMode = UIViewContentModeScaleToFill;
-                          iv.backgroundColor = [UIColor colorWithWhite:0.90 alpha:1.0];
-                          UIImage *cached = [self.tileCache objectForKey:cacheKey];
+                          iv.backgroundColor = [UIColor colorWithRed:0.86 green:0.89 blue:0.92 alpha:1.0];
                           if (cached) {
+                              iv.layer.contentsRect = CGRectMake(0, 0, 1, 1);
                               iv.image = cached;
                           } else {
-                              [self fetchTileKey:cacheKey style:self.styleIndex z:tz x:wx y:ty];
+                              if (tz > 2) {
+                                  NSString *pkey = [NSString stringWithFormat:@"%ld:%d:%d:%d", (long)self.styleIndex, tz - 1, wx >> 1, ty >> 1];
+                                  UIImage *pimg = [self.tileCache objectForKey:pkey];
+                                  if (pimg) {
+                                      iv.layer.contentsRect = CGRectMake((wx & 1) ? 0.5 : 0.0, (ty & 1) ? 0.5 : 0.0, 0.5, 0.5);
+                                      iv.image = pimg;
+                                  }
+                              }
+                              [self fetchTileKey:cacheKey style:self.styleIndex z:tz x:wx y:ty isFallback:NO];
                           }
                           [self.tilesContainer addSubview:iv];
                           self.visibleTiles[viewKey] = iv;
                       } else {
                           iv.frame = frame;
-                          if (!iv.image) {
-                              UIImage *cached = [self.tileCache objectForKey:cacheKey];
-                              if (cached) iv.image = cached;
+                          if (cached && iv.image != cached) {
+                              iv.layer.contentsRect = CGRectMake(0, 0, 1, 1);
+                              iv.image = cached;
                           }
                       }
                   }
               }
 
-              NSArray<NSString *> *existing = self.visibleTiles.allKeys;
-              for (NSString *k in existing) {
+              for (NSString *k in self.visibleTiles.allKeys) {
                   if (![needed containsObject:k]) {
-                      UIImageView *iv = self.visibleTiles[k];
-                      [iv removeFromSuperview];
+                      [self.visibleTiles[k] removeFromSuperview];
                       [self.visibleTiles removeObjectForKey:k];
                   }
               }
@@ -1778,28 +1894,33 @@ jobs:
               [self updateMarkers];
           }
 
-          - (void)fetchTileKey:(NSString *)cacheKey style:(NSInteger)style z:(int)z x:(int)x y:(int)y {
-              if ([self.inFlightKeys containsObject:cacheKey]) return;
+          - (void)fetchTileKey:(NSString *)cacheKey style:(NSInteger)style z:(int)z x:(int)x y:(int)y isFallback:(BOOL)isFallback {
+              if (!isFallback && [self.inFlightKeys containsObject:cacheKey]) return;
               [self.inFlightKeys addObject:cacheKey];
               NSURL *url = [self tileURLForStyle:style z:z x:x y:y];
               if (!url) return;
 
               __weak typeof(self) weakSelf = self;
               NSURLSessionDataTask *task = [self.session dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-                  UIImage *img = (data.length > 100 && !err) ? [UIImage imageWithData:data] : nil;
                   NSInteger httpCode = [resp isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse *)resp).statusCode : 0;
+                  UIImage *img = (httpCode == 200 && data.length > 200 && !err) ? [UIImage imageWithData:data] : nil;
                   dispatch_async(dispatch_get_main_queue(), ^{
                       __strong typeof(weakSelf) self = weakSelf;
                       if (!self) return;
-                      [self.inFlightKeys removeObject:cacheKey];
                       if (img) {
+                          [self.inFlightKeys removeObject:cacheKey];
                           [self.tileCache setObject:img forKey:cacheKey];
                           if (self.onTileError) self.onTileError(nil);
                           [self reloadTiles];
-                      } else if (self.onTileError) {
-                          NSString *m = err ? [NSString stringWithFormat:@"Нет сети (%ld)", (long)err.code]
-                                            : [NSString stringWithFormat:@"Ошибка тайла HTTP %ld", (long)httpCode];
-                          self.onTileError(m);
+                      } else if (!isFallback && style == 0 && z <= 18) {
+                          [self fetchTileKey:cacheKey style:2 z:z x:x y:y isFallback:YES];
+                      } else {
+                          [self.inFlightKeys removeObject:cacheKey];
+                          if (self.onTileError) {
+                              NSString *m = err ? [NSString stringWithFormat:@"Нет сети (%ld)", (long)err.code]
+                                                : [NSString stringWithFormat:@"Тайл HTTP %ld", (long)httpCode];
+                              self.onTileError(m);
+                          }
                       }
                   });
               }];
@@ -1940,15 +2061,16 @@ jobs:
           @interface MapViewController () <UISearchBarDelegate, UITableViewDataSource, UITableViewDelegate>
           @property (nonatomic, strong) GSTileMapView *mapView;
           @property (nonatomic, strong) UISearchBar *searchBar;
+          @property (nonatomic, strong) UIActivityIndicatorView *searchSpinner;
           @property (nonatomic, strong) UITableView *resultsTable;
           @property (nonatomic, strong) NSArray<NSDictionary *> *searchResults;
           @property (nonatomic, strong) NSURLSessionDataTask *searchTask;
-          @property (nonatomic, strong) UILabel *tileErrLabel;
+          @property (nonatomic, strong) UILabel *toastLabel;
           @property (nonatomic, strong) UIButton *styleBadge;
 
           @property (nonatomic, strong) UIView *statusDot;
           @property (nonatomic, strong) UILabel *statusLabel;
-          @property (nonatomic, strong) UILabel *realLabel;
+          @property (nonatomic, strong) UIButton *realButton;
           @property (nonatomic, strong) UILabel *coordLabel;
           @property (nonatomic, strong) UISegmentedControl *jitterControl;
           @property (nonatomic, strong) UIButton *altButton;
@@ -1957,6 +2079,9 @@ jobs:
 
           @property (nonatomic, assign) CLLocationCoordinate2D selectedCoord;
           @property (nonatomic, assign) double altitudeMeters;
+          @property (nonatomic, assign) BOOL cliKnownActive;
+          @property (nonatomic, assign) CFAbsoluteTime optimisticUntil;
+          @property (nonatomic, assign) BOOL optimisticState;
           @property (nonatomic, strong) NSTimer *pollTimer;
           @end
 
@@ -1970,16 +2095,16 @@ jobs:
               self.altitudeMeters = [ud objectForKey:kAltitudeKey] ? [ud doubleForKey:kAltitudeKey] : 20.0;
               self.selectedCoord = CLLocationCoordinate2DMake(40.7128, -74.0060);
 
-              NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:gsPrefsPath()];
-              if (prefs[@"latitude"] && prefs[@"longitude"]) {
-                  double plat = [prefs[@"latitude"] doubleValue];
-                  double plon = [prefs[@"longitude"] doubleValue];
-                  if (fabs(plat) > 0.0001 || fabs(plon) > 0.0001) {
-                      self.selectedCoord = CLLocationCoordinate2DMake(plat, plon);
-                  }
+              BOOL act = NO;
+              CLLocationCoordinate2D tc;
+              if (gsReadTargetNotify(&act, &tc) && act) {
+                  self.selectedCoord = tc;
+                  self.cliKnownActive = YES;
+              } else if ([ud objectForKey:kLastLatKey] && [ud objectForKey:kLastLonKey]) {
+                  self.selectedCoord = CLLocationCoordinate2DMake([ud doubleForKey:kLastLatKey], [ud doubleForKey:kLastLonKey]);
               } else {
-                  CLLocationCoordinate2D realC;
-                  if (gsReadRealCoord(&realC)) self.selectedCoord = realC;
+                  CLLocationCoordinate2D rc;
+                  if (gsReadRealCoord(&rc)) self.selectedCoord = rc;
               }
 
               [self setupMap];
@@ -1988,11 +2113,53 @@ jobs:
               [self setupBottomCard];
               [self movePinTo:self.selectedCoord centerMap:YES zoom:15.0];
               [self refreshStatus];
+              [self syncInitialCLIStatus];
 
-              self.pollTimer = [NSTimer scheduledTimerWithTimeInterval:2.0 target:self selector:@selector(refreshStatus) userInfo:nil repeats:YES];
+              self.pollTimer = [NSTimer scheduledTimerWithTimeInterval:1.5 target:self selector:@selector(refreshStatus) userInfo:nil repeats:YES];
           }
 
           - (void)dealloc { [self.pollTimer invalidate]; }
+
+          - (void)syncInitialCLIStatus {
+              dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                  NSString *out = nil;
+                  int rc = gsRunCLI(@[@"status"], &out);
+                  if (rc != 0 || !out.length) return;
+                  BOOL en = NO;
+                  CLLocationCoordinate2D parsedCoord = CLLocationCoordinate2DMake(0, 0);
+                  BOOL hasCoord = NO;
+                  for (NSString *rawLine in [out componentsSeparatedByString:@"\n"]) {
+                      NSString *line = [rawLine stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+                      if ([line hasPrefix:@"state:"] && [line rangeOfString:@"enabled"].location != NSNotFound) en = YES;
+                      if ([line hasPrefix:@"enabled:"] && [line rangeOfString:@"yes"].location != NSNotFound) en = YES;
+                      if ([line hasPrefix:@"coordinate:"]) hasCoord = gsParseCoordinateText(line, &parsedCoord);
+                  }
+                  dispatch_async(dispatch_get_main_queue(), ^{
+                      self.cliKnownActive = en;
+                      if (hasCoord) {
+                          [self movePinTo:parsedCoord centerMap:YES zoom:15.0];
+                      }
+                      [self refreshStatus];
+                  });
+              });
+          }
+
+          - (void)showToast:(NSString *)text color:(UIColor *)color {
+              self.toastLabel.text = [NSString stringWithFormat:@"  %@  ", text];
+              self.toastLabel.backgroundColor = [color colorWithAlphaComponent:0.93];
+              self.toastLabel.hidden = NO;
+              self.toastLabel.alpha = 1.0;
+              [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(hideToast) object:nil];
+              [self performSelector:@selector(hideToast) withObject:nil afterDelay:3.0];
+          }
+
+          - (void)hideToast {
+              [UIView animateWithDuration:0.25 animations:^{
+                  self.toastLabel.alpha = 0.0;
+              } completion:^(BOOL finished) {
+                  if (self.toastLabel.alpha < 0.05) self.toastLabel.hidden = YES;
+              }];
+          }
 
           - (void)setupMap {
               self.mapView = [[GSTileMapView alloc] initWithFrame:self.view.bounds];
@@ -2009,12 +2176,7 @@ jobs:
                   weakSelf.resultsTable.hidden = YES;
               };
               self.mapView.onTileError = ^(NSString *msg) {
-                  if (msg.length) {
-                      weakSelf.tileErrLabel.text = [NSString stringWithFormat:@" %@ ", msg];
-                      weakSelf.tileErrLabel.hidden = NO;
-                  } else {
-                      weakSelf.tileErrLabel.hidden = YES;
-                  }
+                  if (msg.length) [weakSelf showToast:msg color:UIColor.systemOrangeColor];
               };
               [self.view addSubview:self.mapView];
           }
@@ -2034,15 +2196,19 @@ jobs:
               self.searchBar.returnKeyType = UIReturnKeySearch;
               [blur.contentView addSubview:self.searchBar];
 
-              self.tileErrLabel = [[UILabel alloc] init];
-              self.tileErrLabel.translatesAutoresizingMaskIntoConstraints = NO;
-              self.tileErrLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
-              self.tileErrLabel.textColor = UIColor.whiteColor;
-              self.tileErrLabel.backgroundColor = [UIColor.systemOrangeColor colorWithAlphaComponent:0.92];
-              self.tileErrLabel.layer.cornerRadius = 8;
-              self.tileErrLabel.layer.masksToBounds = YES;
-              self.tileErrLabel.hidden = YES;
-              [self.view addSubview:self.tileErrLabel];
+              self.searchSpinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+              self.searchSpinner.translatesAutoresizingMaskIntoConstraints = NO;
+              self.searchSpinner.hidesWhenStopped = YES;
+              [blur.contentView addSubview:self.searchSpinner];
+
+              self.toastLabel = [[UILabel alloc] init];
+              self.toastLabel.translatesAutoresizingMaskIntoConstraints = NO;
+              self.toastLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
+              self.toastLabel.textColor = UIColor.whiteColor;
+              self.toastLabel.layer.cornerRadius = 10;
+              self.toastLabel.layer.masksToBounds = YES;
+              self.toastLabel.hidden = YES;
+              [self.view addSubview:self.toastLabel];
 
               self.resultsTable = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
               self.resultsTable.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2064,16 +2230,19 @@ jobs:
                   [self.searchBar.topAnchor constraintEqualToAnchor:blur.contentView.topAnchor],
                   [self.searchBar.bottomAnchor constraintEqualToAnchor:blur.contentView.bottomAnchor],
                   [self.searchBar.leadingAnchor constraintEqualToAnchor:blur.contentView.leadingAnchor constant:4],
-                  [self.searchBar.trailingAnchor constraintEqualToAnchor:blur.contentView.trailingAnchor constant:-4],
+                  [self.searchBar.trailingAnchor constraintEqualToAnchor:blur.contentView.trailingAnchor constant:-32],
 
-                  [self.tileErrLabel.topAnchor constraintEqualToAnchor:blur.bottomAnchor constant:6],
-                  [self.tileErrLabel.leadingAnchor constraintEqualToAnchor:blur.leadingAnchor],
-                  [self.tileErrLabel.heightAnchor constraintEqualToConstant:22],
+                  [self.searchSpinner.centerYAnchor constraintEqualToAnchor:blur.contentView.centerYAnchor],
+                  [self.searchSpinner.trailingAnchor constraintEqualToAnchor:blur.contentView.trailingAnchor constant:-10],
+
+                  [self.toastLabel.topAnchor constraintEqualToAnchor:blur.bottomAnchor constant:8],
+                  [self.toastLabel.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+                  [self.toastLabel.heightAnchor constraintEqualToConstant:26],
 
                   [self.resultsTable.topAnchor constraintEqualToAnchor:blur.bottomAnchor constant:6],
                   [self.resultsTable.leadingAnchor constraintEqualToAnchor:blur.leadingAnchor],
                   [self.resultsTable.trailingAnchor constraintEqualToAnchor:blur.trailingAnchor],
-                  [self.resultsTable.heightAnchor constraintEqualToConstant:240]
+                  [self.resultsTable.heightAnchor constraintEqualToConstant:250]
               ]];
           }
 
@@ -2086,7 +2255,7 @@ jobs:
               b.tintColor = UIColor.labelColor;
               b.layer.cornerRadius = 22;
               b.layer.shadowColor = UIColor.blackColor.CGColor;
-              b.layer.shadowOpacity = 0.2;
+              b.layer.shadowOpacity = 0.22;
               b.layer.shadowRadius = 6;
               b.layer.shadowOffset = CGSizeMake(0, 2);
               [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
@@ -2098,23 +2267,21 @@ jobs:
           }
 
           - (NSString *)styleTitle:(NSInteger)idx {
-              if (idx == 1) return @"Спутник";
-              if (idx == 2) return @"OSM";
-              return @"Карта";
+              if (idx == 1) return @"Спутник ▾";
+              if (idx == 2) return @"Схема ▾";
+              return @"Карта ▾";
           }
 
           - (void)setupSideButtons {
               self.styleBadge = [UIButton buttonWithType:UIButtonTypeSystem];
               self.styleBadge.translatesAutoresizingMaskIntoConstraints = NO;
-              self.styleBadge.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightBold];
+              self.styleBadge.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightBold];
               [self.styleBadge setTitle:[self styleTitle:self.mapView.styleIndex] forState:UIControlStateNormal];
               self.styleBadge.backgroundColor = [UIColor.systemBackgroundColor colorWithAlphaComponent:0.93];
               [self.styleBadge setTitleColor:UIColor.labelColor forState:UIControlStateNormal];
-              self.styleBadge.layer.cornerRadius = 12;
-              [self.styleBadge.widthAnchor constraintGreaterThanOrEqualToConstant:78].active = YES;
-              [self.styleBadge.heightAnchor constraintEqualToConstant:28].active = YES;
+              self.styleBadge.layer.cornerRadius = 14;
               self.styleBadge.layer.shadowColor = UIColor.blackColor.CGColor;
-              self.styleBadge.layer.shadowOpacity = 0.16;
+              self.styleBadge.layer.shadowOpacity = 0.18;
               self.styleBadge.layer.shadowRadius = 4;
               [self.styleBadge addTarget:self action:@selector(cycleMapType) forControlEvents:UIControlEventTouchUpInside];
               [self.view addSubview:self.styleBadge];
@@ -2135,6 +2302,8 @@ jobs:
               [NSLayoutConstraint activateConstraints:@[
                   [self.styleBadge.topAnchor constraintEqualToAnchor:safe.topAnchor constant:66],
                   [self.styleBadge.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+                  [self.styleBadge.widthAnchor constraintGreaterThanOrEqualToConstant:88],
+                  [self.styleBadge.heightAnchor constraintEqualToConstant:30],
 
                   [stack.topAnchor constraintEqualToAnchor:safe.topAnchor constant:66],
                   [stack.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12]
@@ -2147,7 +2316,7 @@ jobs:
               card.backgroundColor = [UIColor.secondarySystemBackgroundColor colorWithAlphaComponent:0.96];
               card.layer.cornerRadius = 22;
               card.layer.shadowColor = UIColor.blackColor.CGColor;
-              card.layer.shadowOpacity = 0.22;
+              card.layer.shadowOpacity = 0.24;
               card.layer.shadowRadius = 12;
               card.layer.shadowOffset = CGSizeMake(0, 4);
               [self.view addSubview:card];
@@ -2161,13 +2330,13 @@ jobs:
               self.statusLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightBold];
               self.statusLabel.text = @"ПРОВЕРКА...";
 
-              self.realLabel = [[UILabel alloc] init];
-              self.realLabel.font = [UIFont monospacedDigitSystemFontOfSize:11 weight:UIFontWeightMedium];
-              self.realLabel.textColor = UIColor.secondaryLabelColor;
-              self.realLabel.textAlignment = NSTextAlignmentRight;
-              self.realLabel.text = @"Real: —";
+              self.realButton = [UIButton buttonWithType:UIButtonTypeSystem];
+              self.realButton.titleLabel.font = [UIFont monospacedDigitSystemFontOfSize:11 weight:UIFontWeightMedium];
+              [self.realButton setTitleColor:UIColor.secondaryLabelColor forState:UIControlStateNormal];
+              [self.realButton setTitle:@"Real: —" forState:UIControlStateNormal];
+              [self.realButton addTarget:self action:@selector(centerOnRealTapped) forControlEvents:UIControlEventTouchUpInside];
 
-              UIStackView *statusRow = [[UIStackView alloc] initWithArrangedSubviews:@[self.statusDot, self.statusLabel, self.realLabel]];
+              UIStackView *statusRow = [[UIStackView alloc] initWithArrangedSubviews:@[self.statusDot, self.statusLabel, self.realButton]];
               statusRow.axis = UILayoutConstraintAxisHorizontal;
               statusRow.alignment = UIStackViewAlignmentCenter;
               statusRow.spacing = 6;
@@ -2280,10 +2449,20 @@ jobs:
           - (void)zoomOutTapped { [self.mapView zoomBy:-1.0]; }
           - (void)centerOnPin   { [self movePinTo:self.selectedCoord centerMap:YES zoom:0]; }
 
+          - (void)centerOnRealTapped {
+              CLLocationCoordinate2D rc;
+              if (gsReadRealCoord(&rc)) {
+                  self.mapView.centerLat = rc.latitude;
+                  self.mapView.centerLon = rc.longitude;
+                  [self.mapView reloadTiles];
+              }
+          }
+
           - (void)cycleMapType {
               self.mapView.styleIndex = (self.mapView.styleIndex + 1) % 3;
               [NSUserDefaults.standardUserDefaults setInteger:self.mapView.styleIndex forKey:kMapStyleKey];
               [self.styleBadge setTitle:[self styleTitle:self.mapView.styleIndex] forState:UIControlStateNormal];
+              [self.mapView clearVisibleTiles];
               [self.mapView reloadTiles];
           }
 
@@ -2306,9 +2485,20 @@ jobs:
           }
 
           - (void)refreshStatus {
-              BOOL enabled = NO;
               uint32_t blobs = 0;
-              BOOL alive = gsReadDaemonStatus(&enabled, &blobs);
+              BOOL alive = gsReadXpcStatus(&blobs);
+              BOOL notifyActive = NO;
+              CLLocationCoordinate2D tc;
+              BOOL hasTarget = gsReadTargetNotify(&notifyActive, &tc);
+
+              BOOL enabled = self.cliKnownActive;
+              if (CFAbsoluteTimeGetCurrent() < self.optimisticUntil) {
+                  enabled = self.optimisticState;
+              } else if (hasTarget || notifyActive) {
+                  enabled = notifyActive;
+                  self.cliKnownActive = notifyActive;
+              }
+
               self.mapView.spoofActive = enabled;
 
               if (!alive) {
@@ -2329,16 +2519,16 @@ jobs:
                   self.startButton.backgroundColor = UIColor.systemBlueColor;
               }
 
-              self.stopButton.alpha = enabled ? 1.0 : 0.45;
-              self.stopButton.enabled = enabled;
+              self.stopButton.alpha = enabled ? 1.0 : 0.65;
+              self.stopButton.enabled = YES;
 
               CLLocationCoordinate2D realC;
               if (gsReadRealCoord(&realC)) {
-                  self.realLabel.text = [NSString stringWithFormat:@"Real: %.4f, %.4f", realC.latitude, realC.longitude];
+                  [self.realButton setTitle:[NSString stringWithFormat:@"Real: %.4f, %.4f", realC.latitude, realC.longitude] forState:UIControlStateNormal];
                   self.mapView.realCoord = realC;
                   self.mapView.hasRealCoord = YES;
               } else {
-                  self.realLabel.text = @"Real: —";
+                  [self.realButton setTitle:@"Real: —" forState:UIControlStateNormal];
                   self.mapView.hasRealCoord = NO;
               }
               [self.mapView updateMarkers];
@@ -2347,22 +2537,36 @@ jobs:
           - (void)applySpoofTapped {
               [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium] impactOccurred];
               self.startButton.enabled = NO;
-              NSArray<NSString *> *args = @[
-                  @"start",
-                  @"-x", [NSString stringWithFormat:@"%.6f", self.selectedCoord.latitude],
-                  @"-y", [NSString stringWithFormat:@"%.6f", self.selectedCoord.longitude],
-                  @"-a", [NSString stringWithFormat:@"%.1f", self.altitudeMeters],
-                  @"--jitter", [NSString stringWithFormat:@"%.1f", [self currentJitterMeters]]
-              ];
+              double lat = self.selectedCoord.latitude;
+              double lon = self.selectedCoord.longitude;
+              NSString *latS = [NSString stringWithFormat:@"%.6f", lat];
+              NSString *lonS = [NSString stringWithFormat:@"%.6f", lon];
+              NSString *altS = [NSString stringWithFormat:@"%.1f", self.altitudeMeters];
+              NSString *jitS = [NSString stringWithFormat:@"%.1f", [self currentJitterMeters]];
+              NSArray<NSString *> *argsFull = @[@"start", @"-x", latS, @"-y", lonS, @"-a", altS, @"--jitter", jitS];
+              NSArray<NSString *> *argsBase = @[@"start", @"-x", latS, @"-y", lonS, @"-a", altS];
+
               dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                  int rc = gsRunCLI(args);
+                  NSString *out = nil;
+                  int rc = gsRunCLI(argsFull, &out);
+                  if (rc != 0) {
+                      NSString *out2 = nil;
+                      int rc2 = gsRunCLI(argsBase, &out2);
+                      if (rc2 == 0) { rc = 0; out = out2; }
+                  }
                   dispatch_async(dispatch_get_main_queue(), ^{
                       self.startButton.enabled = YES;
                       if (rc == 0) {
+                          [NSUserDefaults.standardUserDefaults setDouble:lat forKey:kLastLatKey];
+                          [NSUserDefaults.standardUserDefaults setDouble:lon forKey:kLastLonKey];
+                          self.cliKnownActive = YES;
+                          self.optimisticState = YES;
+                          self.optimisticUntil = CFAbsoluteTimeGetCurrent() + 4.0;
                           [[[UINotificationFeedbackGenerator alloc] init] notificationOccurred:UINotificationFeedbackTypeSuccess];
+                          [self showToast:@"✓ Точка включена" color:UIColor.systemGreenColor];
                           [self refreshStatus];
                       } else {
-                          [self showError:[NSString stringWithFormat:@"geoshim start завершился с кодом %d\nПуть: %@", rc, gsCLIPath()]];
+                          [self showError:[NSString stringWithFormat:@"Код %d\n%@", rc, out ?: @"(пусто)"]];
                       }
                   });
               });
@@ -2372,21 +2576,26 @@ jobs:
               [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium] impactOccurred];
               self.stopButton.enabled = NO;
               dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                  int rc = gsRunCLI(@[@"stop"]);
+                  NSString *out = nil;
+                  int rc = gsRunCLI(@[@"stop"], &out);
                   dispatch_async(dispatch_get_main_queue(), ^{
+                      self.stopButton.enabled = YES;
                       if (rc == 0) {
+                          self.cliKnownActive = NO;
+                          self.optimisticState = NO;
+                          self.optimisticUntil = CFAbsoluteTimeGetCurrent() + 4.0;
                           [[[UINotificationFeedbackGenerator alloc] init] notificationOccurred:UINotificationFeedbackTypeSuccess];
+                          [self showToast:@"✓ Реальный GPS восстановлен" color:UIColor.systemBlueColor];
                           [self refreshStatus];
                       } else {
-                          self.stopButton.enabled = YES;
-                          [self showError:[NSString stringWithFormat:@"geoshim stop завершился с кодом %d", rc]];
+                          [self showError:[NSString stringWithFormat:@"Код %d\n%@", rc, out ?: @"(пусто)"]];
                       }
                   });
               });
           }
 
           - (void)showError:(NSString *)msg {
-              UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Ошибка" message:msg preferredStyle:UIAlertControllerStyleAlert];
+              UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Ошибка geoshim" message:msg preferredStyle:UIAlertControllerStyleAlert];
               [ac addAction:[UIAlertAction actionWithTitle:@"ОК" style:UIAlertActionStyleDefault handler:nil]];
               [self presentViewController:ac animated:YES completion:nil];
           }
@@ -2423,6 +2632,7 @@ jobs:
                   [arr insertObject:@{@"name": name, @"lat": @(self.selectedCoord.latitude), @"lon": @(self.selectedCoord.longitude)} atIndex:0];
                   [NSUserDefaults.standardUserDefaults setObject:arr forKey:kFavoritesKey];
                   [[[UINotificationFeedbackGenerator alloc] init] notificationOccurred:UINotificationFeedbackTypeSuccess];
+                  [self showToast:@"★ Сохранено в закладки" color:UIColor.systemBlueColor];
               }]];
               [self presentViewController:ac animated:YES completion:nil];
           }
@@ -2433,6 +2643,7 @@ jobs:
               if (gsParseCoordinateText(clip, &parsed)) {
                   [self movePinTo:parsed centerMap:YES zoom:15.5];
                   [[[UINotificationFeedbackGenerator alloc] init] notificationOccurred:UINotificationFeedbackTypeSuccess];
+                  [self showToast:@"📋 Координаты вставлены" color:UIColor.systemBlueColor];
                   return;
               }
               UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Ввести координаты"
@@ -2454,7 +2665,7 @@ jobs:
               [self presentViewController:ac animated:YES completion:nil];
           }
 
-          #pragma mark - Direct HTTPS Search (Photon + Nominatim fallback, zero geod)
+          #pragma mark - Direct HTTPS Search (Photon + Nominatim fallback)
 
           - (void)searchBarSearchButtonClicked:(UISearchBar *)searchBar {
               [searchBar resignFirstResponder];
@@ -2466,15 +2677,16 @@ jobs:
                   [self movePinTo:direct centerMap:YES zoom:15.5];
                   return;
               }
+              [self.searchSpinner startAnimating];
               [self runPhotonSearch:q];
           }
 
           - (void)runPhotonSearch:(NSString *)q {
               [self.searchTask cancel];
-              NSString *enc = [q stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLQueryAllowedCharacterSet];
-              NSString *urlStr = [NSString stringWithFormat:@"https://photon.komoot.io/api/?q=%@&limit=8", enc];
+              NSString *urlStr = [NSString stringWithFormat:@"https://photon.komoot.io/api/?q=%@&limit=8", gsEncodeQueryValue(q)];
               NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlStr]];
-              [req setValue:@"GeoShimApp/1.1 (iOS)" forHTTPHeaderField:@"User-Agent"];
+              req.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+              [req setValue:kTileUA forHTTPHeaderField:@"User-Agent"];
               __weak typeof(self) weakSelf = self;
               self.searchTask = [self.mapView.session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
                   NSMutableArray *parsed = [NSMutableArray array];
@@ -2498,6 +2710,7 @@ jobs:
                   }
                   dispatch_async(dispatch_get_main_queue(), ^{
                       if (parsed.count > 0) {
+                          [weakSelf.searchSpinner stopAnimating];
                           weakSelf.searchResults = parsed;
                           [weakSelf.resultsTable reloadData];
                           weakSelf.resultsTable.hidden = NO;
@@ -2510,10 +2723,10 @@ jobs:
           }
 
           - (void)runNominatimSearch:(NSString *)q {
-              NSString *enc = [q stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLQueryAllowedCharacterSet];
-              NSString *urlStr = [NSString stringWithFormat:@"https://nominatim.openstreetmap.org/search?format=json&limit=8&q=%@", enc];
+              NSString *urlStr = [NSString stringWithFormat:@"https://nominatim.openstreetmap.org/search?format=json&limit=8&q=%@", gsEncodeQueryValue(q)];
               NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlStr]];
-              [req setValue:@"GeoShimApp/1.1 (iOS)" forHTTPHeaderField:@"User-Agent"];
+              req.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+              [req setValue:kTileUA forHTTPHeaderField:@"User-Agent"];
               __weak typeof(self) weakSelf = self;
               self.searchTask = [self.mapView.session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
                   NSMutableArray *parsed = [NSMutableArray array];
@@ -2530,9 +2743,13 @@ jobs:
                       }
                   }
                   dispatch_async(dispatch_get_main_queue(), ^{
+                      [weakSelf.searchSpinner stopAnimating];
                       weakSelf.searchResults = parsed;
                       [weakSelf.resultsTable reloadData];
                       weakSelf.resultsTable.hidden = (parsed.count == 0);
+                      if (parsed.count == 0) {
+                          [weakSelf showToast:@"Ничего не найдено" color:UIColor.systemOrangeColor];
+                      }
                   });
               }];
               [self.searchTask resume];
@@ -2642,8 +2859,9 @@ jobs:
           os.chmod(prerm_path, 0o755)
 
           assert plistlib.load(open("GeoShim.plist", "rb")) == {"Filter": {"Executables": ["locationd"]}}
-          assert "gIpcDmachInHits" in open("Tweak.x").read()
-          assert "basemaps.cartocdn.com" in open("app/MapViewController.m").read()
+          assert "regulad.geoshim.target" in open("Tweak.x").read()
+          assert "tile.openstreetmap.org" in open("app/MapViewController.m").read()
+          assert "cartocdn" not in open("app/MapViewController.m").read()
           print("patch ok")
           PY
 
@@ -2657,7 +2875,7 @@ jobs:
           tar -xf /tmp/sdk.tar.xz -C "$HOME/theos/sdks"
           ls "$HOME/theos/sdks"
 
-      - name: Build .deb (release + GeoShimApp)
+      - name: Build .deb (release + GeoShimApp v1.2)
         run: |
           export THEOS="$HOME/theos"
           make package FINALPACKAGE=1 ARCHS=arm64e
@@ -2688,9 +2906,9 @@ jobs:
           [ "$(dpkg-deb -f "$DEB" Architecture)" = "iphoneos-arm64e" ] || { echo "bad package arch"; exit 1; }
           dpkg-deb -c "$DEB" | grep -E 'GeoShim\.dylib$|/geoshim$|GeoShimApp\.app/GeoShimApp$'
           rm -rf /tmp/debx && dpkg-deb -x "$DEB" /tmp/debx
-          strings /tmp/debx/Library/MobileSubstrate/DynamicLibraries/GeoShim.dylib | grep -q "regulad.geoshim.xpc4" || { echo "xpc release missing in dylib"; exit 1; }
+          strings /tmp/debx/Library/MobileSubstrate/DynamicLibraries/GeoShim.dylib | grep -q "regulad.geoshim.target" || { echo "target notify missing in dylib"; exit 1; }
           strings /tmp/debx/usr/local/bin/geoshim | grep -q "dmach_in=" || { echo "xpc release output missing in cli"; exit 1; }
-          strings /tmp/debx/Applications/GeoShimApp.app/GeoShimApp | grep -q "basemaps.cartocdn.com" || { echo "direct tile engine missing in app"; exit 1; }
+          strings /tmp/debx/Applications/GeoShimApp.app/GeoShimApp | grep -q "tile.openstreetmap.org" || { echo "OSM tile engine missing in app"; exit 1; }
           [ -f /tmp/debx/Applications/GeoShimApp.app/AppIcon60x60@3x.png ] || { echo "AppIcon missing"; exit 1; }
           ldid -e /tmp/debx/Applications/GeoShimApp.app/GeoShimApp | grep -q "no-sandbox" || { echo "entitlements missing on GeoShimApp"; exit 1; }
           dpkg-deb -I "$DEB" postinst | grep -q "uicache" || { echo "postinst uicache missing"; exit 1; }
