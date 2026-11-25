@@ -67,7 +67,7 @@ jobs:
           tar -xf /tmp/sdk.tar.xz -C "$HOME/theos/sdks"
           ls "$HOME/theos/sdks"
 
-      - name: Build .deb (debug: logging on)
+      - name: "Build .deb (debug: logging on)"
         run: |
           export THEOS="$HOME/theos"
           make package ARCHS=arm64e
