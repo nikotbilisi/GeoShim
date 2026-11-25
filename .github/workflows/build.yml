@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Patch package (daemon-only, no Preferences bundle, no libSandy)
+      - name: Patch package and enable file logging
         run: |
           python3 - << 'PY'
           import re, plistlib, shutil
@@ -35,6 +35,10 @@ jobs:
           open("Tweak.x", "w").write(tx)
           with open("GSConfig.m", "a") as f:
               f.write('\nint libSandy_applyProfile(const char *profileName) { (void)profileName; return 0; }\n')
+
+          with open("GSCommon.h", "a") as f:
+              f.write('\n#ifdef GEOSHIM_DEBUG\n#include <stdio.h>\nstatic inline void GSLogToFile(NSString *m) { FILE *f = fopen("/var/mobile/geoshim.log", "a"); if (f) { fprintf(f, "%s\\n", m.UTF8String); fclose(f); } }\n#undef GSLog\n#define GSLog(fmt, ...) do { NSString *_gsm = [NSString stringWithFormat:@"[GeoShim] " fmt, ##__VA_ARGS__]; NSLog(@"%@", _gsm); GSLogToFile(_gsm); } while (0)\n#endif\n')
+          assert "GSLogToFile" in open("GSCommon.h").read()
 
           mk = open("Makefile").read()
           mk = re.sub(r'(?m)^(\s*\w+_LIBRARIES\s*=.*)$',
@@ -67,12 +71,12 @@ jobs:
           tar -xf /tmp/sdk.tar.xz -C "$HOME/theos/sdks"
           ls "$HOME/theos/sdks"
 
-      - name: "Build .deb (debug: logging on)"
+      - name: Build .deb (debug build)
         run: |
           export THEOS="$HOME/theos"
           make package ARCHS=arm64e
 
-      - name: Verify arm64e ABI and package contents
+      - name: Verify ABI, package and logging code
         run: |
           python3 - << 'PY'
           import glob, os, struct, sys
@@ -97,6 +101,9 @@ jobs:
           dpkg-deb -f "$DEB" Package Version Architecture Depends
           [ "$(dpkg-deb -f "$DEB" Architecture)" = "iphoneos-arm64e" ] || { echo "bad package arch"; exit 1; }
           dpkg-deb -c "$DEB" | grep -E 'GeoShim\.dylib$|/geoshim$'
+          rm -rf /tmp/debx && dpkg-deb -x "$DEB" /tmp/debx
+          strings /tmp/debx/Library/MobileSubstrate/DynamicLibraries/GeoShim.dylib | grep -q "/var/mobile/geoshim.log" || { echo "file logging not compiled in"; exit 1; }
+          python3 -c 'import plistlib; p=plistlib.load(open("/tmp/debx/Library/MobileSubstrate/DynamicLibraries/GeoShim.plist","rb")); assert p=={"Filter":{"Executables":["locationd"]}}, p; print("filter ok")'
 
       - name: Save .deb file
         uses: actions/upload-artifact@v4
