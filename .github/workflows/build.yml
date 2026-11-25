@@ -2921,7 +2921,7 @@ jobs:
           path: packages/*.deb
           if-no-files-found: error
 
-    publish:
+  publish:
     needs: build
     if: always()
     runs-on: ubuntu-22.04
