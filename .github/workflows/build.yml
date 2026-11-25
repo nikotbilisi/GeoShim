@@ -1357,7 +1357,7 @@ jobs:
           APPLICATION_NAME = GeoShimApp
           GeoShimApp_FILES = main.m AppDelegate.m MapViewController.m
           GeoShimApp_FRAMEWORKS = UIKit CoreLocation Foundation QuartzCore
-          GeoShimApp_CFLAGS = -fobjc-arc
+          GeoShimApp_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
           GeoShimApp_CODESIGN_FLAGS = -Sentitlements.plist
 
           include $(THEOS_MAKE_PATH)/application.mk
@@ -2111,7 +2111,8 @@ jobs:
               self.styleBadge.backgroundColor = [UIColor.systemBackgroundColor colorWithAlphaComponent:0.93];
               [self.styleBadge setTitleColor:UIColor.labelColor forState:UIControlStateNormal];
               self.styleBadge.layer.cornerRadius = 12;
-              self.styleBadge.contentEdgeInsets = UIEdgeInsetsMake(5, 10, 5, 10);
+              [self.styleBadge.widthAnchor constraintGreaterThanOrEqualToConstant:78].active = YES;
+              [self.styleBadge.heightAnchor constraintEqualToConstant:28].active = YES;
               self.styleBadge.layer.shadowColor = UIColor.blackColor.CGColor;
               self.styleBadge.layer.shadowOpacity = 0.16;
               self.styleBadge.layer.shadowRadius = 4;
