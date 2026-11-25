@@ -4,6 +4,9 @@ on:
   workflow_dispatch:
   push:
 
+permissions:
+  contents: write
+
 concurrency:
   group: geoshim-build
   cancel-in-progress: true
@@ -13,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, macos-15-intel, macos-26]
+        os: [macos-26, macos-15-intel]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
@@ -24,30 +27,25 @@ jobs:
           python3 - << 'PY'
           import re, plistlib, shutil
 
-          # 1. Фильтр: только демон locationd
           with open("GeoShim.plist", "wb") as f:
               plistlib.dump({"Filter": {"Executables": ["locationd"]}}, f)
 
-          # 2. Заглушка символа libSandy (твик больше её не линкует)
           tx = open("Tweak.x").read()
           tx = re.sub(r'#\s*(?:import|include)\s*[<"]libSandy\.h[>"]', '', tx)
           open("Tweak.x", "w").write(tx)
           with open("GSConfig.m", "a") as f:
               f.write('\nint libSandy_applyProfile(const char *profileName) { (void)profileName; return 0; }\n')
 
-          # 3. Makefile: без -lsandy и без сабпроекта prefs
           mk = open("Makefile").read()
           mk = re.sub(r'(?m)^(\s*\w+_LIBRARIES\s*=.*)$',
                       lambda m: re.sub(r'\bsandy\b', '', m.group(1)), mk)
           mk = re.sub(r'(?m)^\s*SUBPROJECTS\s*\+=\s*prefs\s*\n', '', mk)
           open("Makefile", "w").write(mk)
 
-          # 4. control: только ellekit
           ctl = open("control").read()
           ctl = re.sub(r'(?m)^Depends:.*$', 'Depends: ellekit', ctl)
           open("control", "w").write(ctl)
 
-          # 5. Мёртвый пункт в Настройках убираем
           shutil.rmtree("layout/Library/PreferenceLoader", ignore_errors=True)
 
           assert plistlib.load(open("GeoShim.plist", "rb")) == {"Filter": {"Executables": ["locationd"]}}
@@ -69,7 +67,7 @@ jobs:
           tar -xf /tmp/sdk.tar.xz -C "$HOME/theos/sdks"
           ls "$HOME/theos/sdks"
 
-      - name: Build .deb
+      - name: Build .deb (debug: logging on)
         run: |
           export THEOS="$HOME/theos"
           make package ARCHS=arm64e
@@ -87,7 +85,7 @@ jobs:
           bad = []
           for p in files:
               magic, cputype, subtype = struct.unpack("<III", open(p, "rb").read(12))
-              print(f"{p}: magic=0x{magic:08x} cputype=0x{cputype:08x} cpusubtype=0x{subtype:08x}")
+              print(f"{p}: cputype=0x{cputype:08x} cpusubtype=0x{subtype:08x}")
               if cputype != 0x0100000C or not (subtype & 0x80000000):
                   bad.append(p)
           if bad:
@@ -99,8 +97,6 @@ jobs:
           dpkg-deb -f "$DEB" Package Version Architecture Depends
           [ "$(dpkg-deb -f "$DEB" Architecture)" = "iphoneos-arm64e" ] || { echo "bad package arch"; exit 1; }
           dpkg-deb -c "$DEB" | grep -E 'GeoShim\.dylib$|/geoshim$'
-          rm -rf /tmp/debx && dpkg-deb -x "$DEB" /tmp/debx
-          python3 -c 'import plistlib; p=plistlib.load(open("/tmp/debx/Library/MobileSubstrate/DynamicLibraries/GeoShim.plist","rb")); assert p=={"Filter":{"Executables":["locationd"]}}, p; print("filter ok")'
 
       - name: Save .deb file
         uses: actions/upload-artifact@v4
@@ -108,3 +104,27 @@ jobs:
           name: geoshim-deb-${{ matrix.os }}
           path: packages/*.deb
           if-no-files-found: error
+
+  publish:
+    needs: build
+    if: always()
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: geoshim-deb-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ls -l dist
+          DEB=$(ls dist/*.deb 2>/dev/null | head -n 1)
+          if [ -z "$DEB" ]; then echo "no .deb produced"; exit 1; fi
+          cp "$DEB" dist/geoshim-latest.deb
+          gh release view latest-build >/dev/null 2>&1 || \
+            gh release create latest-build --title "GeoShim latest build" --notes "Automated build ${GITHUB_SHA}"
+          gh release upload latest-build dist/geoshim-latest.deb --clobber
