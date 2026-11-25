@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Patch package, logging and XPC read-only probe v2
+      - name: Patch package with iOS 18 XPC location rewriter
         run: |
           python3 - << 'PY'
           import re, plistlib, shutil
@@ -54,14 +54,15 @@ jobs:
           ''')
 
           old_anchor = "static IMP gEncodeWithCoderOrig = NULL;"
-          diag_block = old_anchor + r'''
+          xpc_rewriter = old_anchor + r'''
 
-          // --- GeoShim diagnostics + read-only XPC probe v2 ---
+          // --- GeoShim iOS 18 XPC bplist17/CLClientLocation rewriter ---
           #include <notify.h>
           #include <dispatch/dispatch.h>
           #include <stdatomic.h>
           #include <stdbool.h>
           #include <stdint.h>
+          #include <stdlib.h>
           #include <string.h>
           #include <math.h>
           #include <dlfcn.h>
@@ -76,21 +77,16 @@ jobs:
           extern const struct _xpc_type_s _xpc_type_dictionary;
           extern const struct _xpc_type_s _xpc_type_array;
           extern const struct _xpc_type_s _xpc_type_data;
-          extern const struct _xpc_type_s _xpc_type_double;
-          extern const struct _xpc_type_s _xpc_type_string;
           #define XPC_TYPE_DICTIONARY (&_xpc_type_dictionary)
           #define XPC_TYPE_ARRAY (&_xpc_type_array)
           #define XPC_TYPE_DATA (&_xpc_type_data)
-          #define XPC_TYPE_DOUBLE (&_xpc_type_double)
-          #define XPC_TYPE_STRING (&_xpc_type_string)
           extern xpc_type_t xpc_get_type(xpc_object_t obj);
           extern bool xpc_dictionary_apply(xpc_object_t xdict, bool (^applier)(const char *key, xpc_object_t value));
           extern bool xpc_array_apply(xpc_object_t xarray, bool (^applier)(size_t index, xpc_object_t value));
-          extern const char *xpc_dictionary_get_string(xpc_object_t xdict, const char *key);
-          extern const char *xpc_string_get_string_ptr(xpc_object_t xstring);
           extern const void *xpc_data_get_bytes_ptr(xpc_object_t xdata);
           extern size_t xpc_data_get_length(xpc_object_t xdata);
-          extern double xpc_double_get_value(xpc_object_t xdouble);
+          extern void xpc_dictionary_set_data(xpc_object_t xdict, const char *key, const void *bytes, size_t length);
+          extern void xpc_array_set_data(xpc_object_t xarray, size_t index, const void *bytes, size_t length);
           extern void xpc_connection_send_message(xpc_connection_t conn, xpc_object_t msg);
           extern void xpc_connection_send_message_with_reply(xpc_connection_t conn, xpc_object_t msg, dispatch_queue_t q, xpc_handler_t h);
           #endif
@@ -101,48 +97,19 @@ jobs:
 
           static double gLastRealLat = 0.0, gLastRealLon = 0.0;
           static _Atomic uint32_t gHasRealCoord = 0;
-          static double gLastFakeLat = 0.0, gLastFakeLon = 0.0;
-          static _Atomic uint32_t gHasFakeCoord = 0;
 
-          static _Atomic uint32_t gXpcMsgCalls = 0;
-          static _Atomic uint32_t gXpcNotifCalls = 0;
           static _Atomic uint32_t gXpcHookedMsg = 0;
           static _Atomic uint32_t gXpcHookedNotif = 0;
           static _Atomic uint32_t gXpcHookedReply = 0;
-          static _Atomic uint32_t gXpcSawData = 0;
-          static _Atomic uint32_t gXpcSawArr = 0;
-          static _Atomic uint32_t gXpcDblKey = 0;
-
-          static _Atomic uint32_t gXpcHits = 0;
-          static _Atomic uint32_t gXpcFakeHits = 0;
-          static _Atomic uint32_t gXpcBlobLen = 0;
-          static _Atomic uint32_t gXpcLatOff = 0xFFF;
-          static _Atomic uint32_t gXpcLonOff = 0xFFF;
-          static _Atomic uint32_t gXpcFnMask = 0;
-          static _Atomic uint32_t gXpcFlags = 0; // bit0=bplist, bit1=big_endian
-          static _Atomic uint64_t gXpcKeyA = 0, gXpcKeyB = 0;
-          static _Atomic uint64_t gXpcMsgA = 0, gXpcMsgB = 0;
+          static _Atomic uint32_t gXpcBlobsRewritten = 0;
+          static _Atomic uint32_t gXpcPairsRewritten = 0;
+          static _Atomic uint32_t gXpcTotalCalls = 0;
 
           static __thread int gInXpcHook = 0;
 
-          #define GS_DIAG_NOTIFY  "xyz.regulad.geoshim.diag"
-          #define GS_REAL_NOTIFY  "xyz.regulad.geoshim.real"
-          #define GS_XPC_NOTIFY   "xyz.regulad.geoshim.xpc"
-          #define GS_XPC2_NOTIFY  "xyz.regulad.geoshim.xpc2"
-          #define GS_KEYA_NOTIFY  "xyz.regulad.geoshim.keya"
-          #define GS_KEYB_NOTIFY  "xyz.regulad.geoshim.keyb"
-          #define GS_MSGA_NOTIFY  "xyz.regulad.geoshim.msga"
-          #define GS_MSGB_NOTIFY  "xyz.regulad.geoshim.msgb"
-
-          static uint64_t gs_pack8(const char *s, size_t offset) {
-              uint64_t v = 0;
-              if (!s) return 0;
-              size_t n = strlen(s);
-              for (size_t i = 0; i < 8 && (offset + i) < n; i++) {
-                  v |= ((uint64_t)(uint8_t)s[offset + i]) << (i * 8);
-              }
-              return v;
-          }
+          #define GS_DIAG_NOTIFY "xyz.regulad.geoshim.diag"
+          #define GS_REAL_NOTIFY "xyz.regulad.geoshim.real"
+          #define GS_XPC_NOTIFY  "xyz.regulad.geoshim.xpc"
 
           static void gs_set_state(const char *name, int *tok, uint64_t val) {
               if (*tok == -1) notify_register_check(name, tok);
@@ -165,149 +132,191 @@ jobs:
           }
 
           static void gs_xpc_publish(void) {
-              static int tok1 = -1, tok2 = -1, tka = -1, tkb = -1, tma = -1, tmb = -1;
-              uint32_t hits = atomic_load(&gXpcHits);
-              uint64_t v1 = (hits ? (1ULL << 63) : 0ULL)
-                          | (uint64_t)(hits & 0xFFFF)
-                          | ((uint64_t)(atomic_load(&gXpcBlobLen) & 0xFFFF) << 16)
-                          | ((uint64_t)(atomic_load(&gXpcLatOff) & 0xFFF) << 32)
-                          | ((uint64_t)(atomic_load(&gXpcLonOff) & 0xFFF) << 44)
-                          | ((uint64_t)(atomic_load(&gXpcFnMask) & 0x7) << 56)
-                          | ((uint64_t)(atomic_load(&gXpcFlags) & 0x3) << 59);
-              gs_set_state(GS_XPC_NOTIFY, &tok1, v1);
-
-              uint64_t v2 = (1ULL << 63)
-                          | ((uint64_t)(atomic_load(&gXpcHookedMsg) & 1) << 62)
-                          | ((uint64_t)(atomic_load(&gXpcHookedNotif) & 1) << 61)
-                          | ((uint64_t)(atomic_load(&gHasRealCoord) & 1) << 60)
-                          | ((uint64_t)(atomic_load(&gXpcHookedReply) & 1) << 55)
-                          | ((uint64_t)(atomic_load(&gXpcDblKey) & 1) << 54)
-                          | ((uint64_t)(atomic_load(&gXpcSawArr) & 1) << 53)
-                          | ((uint64_t)(atomic_load(&gXpcSawData) & 1) << 52)
-                          | ((uint64_t)(atomic_load(&gXpcFakeHits) & 0xFFF) << 40)
-                          | ((uint64_t)(atomic_load(&gXpcNotifCalls) & 0xFFFFF) << 20)
-                          | (uint64_t)(atomic_load(&gXpcMsgCalls) & 0xFFFFF);
-              gs_set_state(GS_XPC2_NOTIFY, &tok2, v2);
-
-              if (hits) {
-                  gs_set_state(GS_KEYA_NOTIFY, &tka, atomic_load(&gXpcKeyA));
-                  gs_set_state(GS_KEYB_NOTIFY, &tkb, atomic_load(&gXpcKeyB));
-                  gs_set_state(GS_MSGA_NOTIFY, &tma, atomic_load(&gXpcMsgA));
-                  gs_set_state(GS_MSGB_NOTIFY, &tmb, atomic_load(&gXpcMsgB));
-              }
+              static int tok = -1;
+              uint64_t v = (1ULL << 63)
+                         | ((uint64_t)(atomic_load(&gXpcHookedMsg) & 1) << 62)
+                         | ((uint64_t)(atomic_load(&gXpcHookedNotif) & 1) << 61)
+                         | ((uint64_t)(atomic_load(&gXpcHookedReply) & 1) << 60)
+                         | ((uint64_t)(atomic_load(&gXpcBlobsRewritten) & 0xFFFFF) << 20)
+                         | (uint64_t)(atomic_load(&gXpcPairsRewritten) & 0xFFFFF);
+              gs_set_state(GS_XPC_NOTIFY, &tok, v);
           }
 
           static void gs_diag_inc(_Atomic uint32_t *c) { atomic_fetch_add(c, 1); gs_diag_publish(); }
 
-          static inline double gs_bswap_double(uint64_t raw) {
-              uint64_t sw = __builtin_bswap64(raw);
-              double d;
-              memcpy(&d, &sw, 8);
-              return d;
-          }
+          typedef struct { char *key; uint8_t *buf; size_t len; } gs_dict_patch_t;
+          typedef struct { gs_dict_patch_t items[16]; int count; } gs_dict_patch_list_t;
+          typedef struct { size_t idx; uint8_t *buf; size_t len; } gs_arr_patch_t;
+          typedef struct { gs_arr_patch_t items[16]; int count; } gs_arr_patch_list_t;
 
-          static bool gs_find_coord_pair(const uint8_t *p, size_t lim, double tlat, double tlon,
-                                         uint32_t *outLatOff, uint32_t *outLonOff, uint32_t *outBE) {
-              if (fabs(tlat) < 0.1 && fabs(tlon) < 0.1) return false;
-              uint32_t latOff = 0xFFF, lonOff = 0xFFF, isBE = 0;
-              for (size_t off = 0; off + 8 <= lim; off++) {
-                  double d;
-                  memcpy(&d, p + off, 8);
-                  if (fabs(d - tlat) < 0.05) { latOff = (uint32_t)off; isBE = 0; break; }
-                  uint64_t u;
-                  memcpy(&u, p + off, 8);
-                  double b = gs_bswap_double(u);
-                  if (fabs(b - tlat) < 0.05) { latOff = (uint32_t)off; isBE = 1; break; }
-              }
-              if (latOff == 0xFFF) return false;
-              for (size_t off = 0; off + 8 <= lim; off++) {
-                  if (off == latOff) continue;
-                  if (!isBE) {
-                      double d;
-                      memcpy(&d, p + off, 8);
-                      if (fabs(d - tlon) < 0.05) { lonOff = (uint32_t)off; break; }
-                  } else {
-                      uint64_t u;
-                      memcpy(&u, p + off, 8);
-                      if (fabs(gs_bswap_double(u) - tlon) < 0.05) { lonOff = (uint32_t)off; break; }
+          static bool gs_blob_contains_real(const uint8_t *p, size_t len, double rlat, double rlon) {
+              if (!p || len < 16) return false;
+              size_t lim = len > 65536 ? 65536 : len;
+              for (size_t off = 0; off + 16 <= lim; off++) {
+                  double d0, d1;
+                  memcpy(&d0, p + off, 8);
+                  if (!isfinite(d0) || fabs(d0 - rlat) >= 0.25) continue;
+                  memcpy(&d1, p + off + 8, 8);
+                  if (isfinite(d1) && fabs(d1 - rlon) < 0.25) return true;
+                  if (off + 17 <= lim && (p[off + 8] == 0x23 || p[off + 8] == 0x22)) {
+                      double d1t;
+                      memcpy(&d1t, p + off + 9, 8);
+                      if (isfinite(d1t) && fabs(d1t - rlon) < 0.25) return true;
                   }
               }
-              if (lonOff == 0xFFF) return false;
-              if (outLatOff) *outLatOff = latOff;
-              if (outLonOff) *outLonOff = lonOff;
-              if (outBE) *outBE = isBE;
-              return true;
+              return false;
           }
 
-          static void gs_scan_xpc_blob(const uint8_t *p, size_t len, uint32_t fnBit, const char *mname, const char *kname) {
-              if (!p || len < 16) return;
-              atomic_store(&gXpcSawData, 1);
-              size_t lim = len > 8192 ? 8192 : len;
-              if (atomic_load_explicit(&gHasFakeCoord, memory_order_acquire)) {
-                  if (gs_find_coord_pair(p, lim, gLastFakeLat, gLastFakeLon, NULL, NULL, NULL)) {
-                      atomic_fetch_add(&gXpcFakeHits, 1);
+          static uint8_t *gs_make_patched_blob(const uint8_t *src, size_t len,
+                                               double rlat, double rlon,
+                                               double flat, double flon,
+                                               uint32_t *outPairs) {
+              if (!gs_blob_contains_real(src, len, rlat, rlon)) return NULL;
+              uint8_t *buf = (uint8_t *)malloc(len);
+              if (!buf) return NULL;
+              memcpy(buf, src, len);
+              size_t lim = len > 65536 ? 65536 : len;
+              uint32_t pairs = 0;
+              for (size_t off = 0; off + 16 <= lim; off++) {
+                  double d0, d1;
+                  memcpy(&d0, buf + off, 8);
+                  if (!isfinite(d0) || fabs(d0 - rlat) >= 0.25) continue;
+                  memcpy(&d1, buf + off + 8, 8);
+                  if (isfinite(d1) && fabs(d1 - rlon) < 0.25) {
+                      if (fabs(d0 - flat) > 0.0005 || fabs(d1 - flon) > 0.0005) {
+                          gLastRealLat = d0;
+                          gLastRealLon = d1;
+                      }
+                      memcpy(buf + off, &flat, 8);
+                      memcpy(buf + off + 8, &flon, 8);
+                      pairs++;
+                      off += 15;
+                      continue;
+                  }
+                  if (off + 17 <= lim && (buf[off + 8] == 0x23 || buf[off + 8] == 0x22)) {
+                      double d1t;
+                      memcpy(&d1t, buf + off + 9, 8);
+                      if (isfinite(d1t) && fabs(d1t - rlon) < 0.25) {
+                          if (fabs(d0 - flat) > 0.0005 || fabs(d1t - flon) > 0.0005) {
+                              gLastRealLat = d0;
+                              gLastRealLon = d1t;
+                          }
+                          memcpy(buf + off, &flat, 8);
+                          memcpy(buf + off + 9, &flon, 8);
+                          pairs++;
+                          off += 16;
+                      }
                   }
               }
-              if (atomic_load_explicit(&gHasRealCoord, memory_order_acquire)) {
-                  uint32_t latOff = 0xFFF, lonOff = 0xFFF, isBE = 0;
-                  if (gs_find_coord_pair(p, lim, gLastRealLat, gLastRealLon, &latOff, &lonOff, &isBE)) {
-                      uint32_t isBP = (len >= 6 && memcmp(p, "bplist", 6) == 0) ? 1 : 0;
-                      atomic_fetch_add(&gXpcHits, 1);
-                      atomic_store(&gXpcBlobLen, (uint32_t)(len & 0xFFFF));
-                      atomic_store(&gXpcLatOff, latOff > 0xFFE ? 0xFFE : latOff);
-                      atomic_store(&gXpcLonOff, lonOff > 0xFFE ? 0xFFE : lonOff);
-                      atomic_fetch_or(&gXpcFnMask, fnBit);
-                      atomic_store(&gXpcFlags, (isBP ? 1u : 0u) | (isBE ? 2u : 0u));
-                      atomic_store(&gXpcKeyA, gs_pack8(kname, 0));
-                      atomic_store(&gXpcKeyB, gs_pack8(kname, 8));
-                      atomic_store(&gXpcMsgA, gs_pack8(mname, 0));
-                      atomic_store(&gXpcMsgB, gs_pack8(mname, 8));
-                      gs_xpc_publish();
-                  }
-              }
+              if (pairs == 0) { free(buf); return NULL; }
+              if (outPairs) *outPairs = pairs;
+              return buf;
           }
 
-          static void gs_scan_xpc_val(xpc_object_t val, int depth, uint32_t fnBit, const char *mname, const char *kname) {
-              if (!val || depth > 4) return;
-              xpc_type_t t = xpc_get_type(val);
-              if (t == XPC_TYPE_DATA) {
-                  gs_scan_xpc_blob((const uint8_t *)xpc_data_get_bytes_ptr(val), xpc_data_get_length(val), fnBit, mname, kname);
-              } else if (t == XPC_TYPE_DICTIONARY) {
-                  xpc_dictionary_apply(val, ^bool(const char *key, xpc_object_t v) {
-                      gs_scan_xpc_val(v, depth + 1, fnBit, mname, key ? key : kname);
-                      return true;
-                  });
-              } else if (t == XPC_TYPE_ARRAY) {
-                  atomic_store(&gXpcSawArr, 1);
-                  xpc_array_apply(val, ^bool(size_t idx, xpc_object_t v) {
-                      (void)idx;
-                      gs_scan_xpc_val(v, depth + 1, fnBit, mname, kname);
-                      return true;
-                  });
-              } else if (t == XPC_TYPE_DOUBLE && atomic_load_explicit(&gHasRealCoord, memory_order_acquire)) {
-                  double d = xpc_double_get_value(val);
-                  if (fabs(gLastRealLat) > 0.1 && fabs(d - gLastRealLat) < 0.05) {
-                      atomic_store(&gXpcDblKey, 1);
-                  }
-              }
-          }
-
-          static void gs_scan_xpc_top(xpc_object_t msg, uint32_t fnBit) {
-              if (!msg || xpc_get_type(msg) != XPC_TYPE_DICTIONARY) return;
-              const char *mname = xpc_dictionary_get_string(msg, "kCLConnectionMessageNameKey");
-              __block const char *fallbackName = NULL;
-              if (!mname) {
-                  xpc_dictionary_apply(msg, ^bool(const char *k, xpc_object_t v) {
-                      (void)k;
-                      if (v && xpc_get_type(v) == XPC_TYPE_STRING) {
-                          const char *s = xpc_string_get_string_ptr(v);
-                          if (s && s[0]) { fallbackName = s; return false; }
+          static bool gs_rewrite_xpc_obj(xpc_object_t obj, int depth,
+                                         double rlat, double rlon,
+                                         double flat, double flon) {
+              if (!obj || depth > 4) return false;
+              xpc_type_t t = xpc_get_type(obj);
+              bool changed = false;
+              if (t == XPC_TYPE_DICTIONARY) {
+                  gs_dict_patch_list_t dlist;
+                  memset(&dlist, 0, sizeof(dlist));
+                  gs_dict_patch_list_t *dp = &dlist;
+                  __block bool childChanged = false;
+                  xpc_dictionary_apply(obj, ^bool(const char *key, xpc_object_t val) {
+                      if (!val) return true;
+                      xpc_type_t vt = xpc_get_type(val);
+                      if (vt == XPC_TYPE_DATA && key && dp->count < 16) {
+                          const uint8_t *p = (const uint8_t *)xpc_data_get_bytes_ptr(val);
+                          size_t len = xpc_data_get_length(val);
+                          uint32_t pairs = 0;
+                          uint8_t *patched = gs_make_patched_blob(p, len, rlat, rlon, flat, flon, &pairs);
+                          if (patched) {
+                              char *kcopy = strdup(key);
+                              if (kcopy) {
+                                  dp->items[dp->count].key = kcopy;
+                                  dp->items[dp->count].buf = patched;
+                                  dp->items[dp->count].len = len;
+                                  dp->count++;
+                                  atomic_fetch_add(&gXpcBlobsRewritten, 1);
+                                  atomic_fetch_add(&gXpcPairsRewritten, pairs);
+                              } else {
+                                  free(patched);
+                              }
+                          }
+                      } else if (vt == XPC_TYPE_DICTIONARY || vt == XPC_TYPE_ARRAY) {
+                          if (gs_rewrite_xpc_obj(val, depth + 1, rlat, rlon, flat, flon)) {
+                              childChanged = true;
+                          }
                       }
                       return true;
                   });
-                  mname = fallbackName;
+                  for (int i = 0; i < dlist.count; i++) {
+                      xpc_dictionary_set_data(obj, dlist.items[i].key, dlist.items[i].buf, dlist.items[i].len);
+                      free(dlist.items[i].key);
+                      free(dlist.items[i].buf);
+                      changed = true;
+                  }
+                  if (childChanged) changed = true;
+              } else if (t == XPC_TYPE_ARRAY) {
+                  gs_arr_patch_list_t alist;
+                  memset(&alist, 0, sizeof(alist));
+                  gs_arr_patch_list_t *ap = &alist;
+                  __block bool childChanged = false;
+                  xpc_array_apply(obj, ^bool(size_t idx, xpc_object_t val) {
+                      if (!val) return true;
+                      xpc_type_t vt = xpc_get_type(val);
+                      if (vt == XPC_TYPE_DATA && ap->count < 16) {
+                          const uint8_t *p = (const uint8_t *)xpc_data_get_bytes_ptr(val);
+                          size_t len = xpc_data_get_length(val);
+                          uint32_t pairs = 0;
+                          uint8_t *patched = gs_make_patched_blob(p, len, rlat, rlon, flat, flon, &pairs);
+                          if (patched) {
+                              ap->items[ap->count].idx = idx;
+                              ap->items[ap->count].buf = patched;
+                              ap->items[ap->count].len = len;
+                              ap->count++;
+                              atomic_fetch_add(&gXpcBlobsRewritten, 1);
+                              atomic_fetch_add(&gXpcPairsRewritten, pairs);
+                          }
+                      } else if (vt == XPC_TYPE_DICTIONARY || vt == XPC_TYPE_ARRAY) {
+                          if (gs_rewrite_xpc_obj(val, depth + 1, rlat, rlon, flat, flon)) {
+                              childChanged = true;
+                          }
+                      }
+                      return true;
+                  });
+                  for (int i = 0; i < alist.count; i++) {
+                      xpc_array_set_data(obj, alist.items[i].idx, alist.items[i].buf, alist.items[i].len);
+                      free(alist.items[i].buf);
+                      changed = true;
+                  }
+                  if (childChanged) changed = true;
               }
-              gs_scan_xpc_val(msg, 0, fnBit, mname ? mname : "", "");
+              return changed;
+          }
+
+          static void gs_handle_outbound_xpc(xpc_object_t msg) {
+              if (!msg || !atomic_load_explicit(&gHasRealCoord, memory_order_acquire)) return;
+              double rlat = gLastRealLat, rlon = gLastRealLon;
+              if (fabs(rlat) < 0.05 && fabs(rlon) < 0.05) return;
+              @autoreleasepool {
+                  @try {
+                      GSLocationFactory *factory = [GSLocationFactory shared];
+                      if (!factory.active) return;
+                      CLLocation *dummy = [[CLLocation alloc] initWithLatitude:rlat longitude:rlon];
+                      CLLocation *fake = [factory spoofedLocationFromReal:dummy];
+                      if (!fake || !CLLocationCoordinate2DIsValid(fake.coordinate)) return;
+                      bool did = gs_rewrite_xpc_obj(msg, 0, rlat, rlon,
+                                                    fake.coordinate.latitude,
+                                                    fake.coordinate.longitude);
+                      uint32_t n = atomic_fetch_add(&gXpcTotalCalls, 1) + 1;
+                      if (did || (n & 63) == 1) gs_xpc_publish();
+                  } @catch (NSException *e) {
+                      (void)e;
+                  }
+              }
           }
 
           static void (*gOrigXpcSendMsg)(xpc_connection_t, xpc_object_t) = NULL;
@@ -317,9 +326,7 @@ jobs:
           static void gs_xpc_send_msg(xpc_connection_t conn, xpc_object_t msg) {
               if (!gInXpcHook) {
                   gInXpcHook = 1;
-                  uint32_t n = atomic_fetch_add(&gXpcMsgCalls, 1) + 1;
-                  gs_scan_xpc_top(msg, 1);
-                  if ((n & 31) == 1) gs_xpc_publish();
+                  gs_handle_outbound_xpc(msg);
                   gInXpcHook = 0;
               }
               if (gOrigXpcSendMsg) gOrigXpcSendMsg(conn, msg);
@@ -328,9 +335,7 @@ jobs:
           static void gs_xpc_send_notif(xpc_connection_t conn, xpc_object_t msg) {
               if (!gInXpcHook) {
                   gInXpcHook = 1;
-                  uint32_t n = atomic_fetch_add(&gXpcNotifCalls, 1) + 1;
-                  gs_scan_xpc_top(msg, 2);
-                  if ((n & 31) == 1) gs_xpc_publish();
+                  gs_handle_outbound_xpc(msg);
                   gInXpcHook = 0;
               }
               if (gOrigXpcSendNotif) gOrigXpcSendNotif(conn, msg);
@@ -339,7 +344,7 @@ jobs:
           static void gs_xpc_send_reply(xpc_connection_t conn, xpc_object_t msg, dispatch_queue_t q, xpc_handler_t h) {
               if (!gInXpcHook) {
                   gInXpcHook = 1;
-                  gs_scan_xpc_top(msg, 4);
+                  gs_handle_outbound_xpc(msg);
                   gInXpcHook = 0;
               }
               if (gOrigXpcSendReply) gOrigXpcSendReply(conn, msg, q, h);
@@ -361,7 +366,7 @@ jobs:
               gInXpcHook = 0;
           }'''
           assert tx.count(old_anchor) == 1
-          tx = tx.replace(old_anchor, diag_block, 1)
+          tx = tx.replace(old_anchor, xpc_rewriter, 1)
 
           old_fn = '''static void gs_encodeWithCoder(id self, SEL _cmd, NSCoder *coder) {
               @try {
@@ -414,9 +419,6 @@ jobs:
                           [factory noteRealLocation:real];
                           CLLocation *fake = [factory spoofedLocationFromReal:real];
                           if (fake && gEncodeWithCoderOrig) {
-                              gLastFakeLat = fake.coordinate.latitude;
-                              gLastFakeLon = fake.coordinate.longitude;
-                              atomic_store_explicit(&gHasFakeCoord, 1, memory_order_release);
                               gs_diag_inc(&gDiagSpoof);
                               if (GEOSHIM_DEBUG_BUILD) {
                                   GSLog(@"locationd: encode %f,%f -> %f,%f",
@@ -443,15 +445,7 @@ jobs:
 
           m = open("cli/main.m").read()
           old_json_anchor = "static int commandStatusJSON(void) {"
-          diag_fn = '''static void gs_unpack16(const char *tA, const char *tB, char out[17]) {
-              memset(out, 0, 17);
-              uint64_t a = 0, b = 0; int t = -1;
-              if (notify_register_check(tA, &t) == NOTIFY_STATUS_OK) { notify_get_state(t, &a); notify_cancel(t); }
-              if (notify_register_check(tB, &t) == NOTIFY_STATUS_OK) { notify_get_state(t, &b); notify_cancel(t); }
-              memcpy(out, &a, 8); memcpy(out + 8, &b, 8);
-          }
-
-          static void printEncodeDiag(void) {
+          diag_fn = '''static void printEncodeDiag(void) {
               int tok = -1;
               if (notify_register_check("xyz.regulad.geoshim.diag", &tok) == NOTIFY_STATUS_OK) {
                   uint64_t v = 0;
@@ -472,41 +466,18 @@ jobs:
                   int32_t ilon = (int32_t)(uint32_t)((rv >> 32) & 0xFFFFFFFFULL);
                   printf("  real coord:  %.4f, %.4f\\n", ilat / 10000.0, ilon / 10000.0);
               }
-              int t2 = -1;
-              if (notify_register_check("xyz.regulad.geoshim.xpc2", &t2) == NOTIFY_STATUS_OK) {
-                  uint64_t v2 = 0;
-                  notify_get_state(t2, &v2);
-                  notify_cancel(t2);
-                  printf("  xpc probe:   alive=%u hooks=%u/%u/%u real=%u data=%u arr=%u dbl=%u fake_hits=%llu msg=%llu notif=%llu\\n",
-                         (unsigned)((v2 >> 63) & 1),
-                         (unsigned)((v2 >> 62) & 1),
-                         (unsigned)((v2 >> 61) & 1),
-                         (unsigned)((v2 >> 55) & 1),
-                         (unsigned)((v2 >> 60) & 1),
-                         (unsigned)((v2 >> 52) & 1),
-                         (unsigned)((v2 >> 53) & 1),
-                         (unsigned)((v2 >> 54) & 1),
-                         (unsigned long long)((v2 >> 40) & 0xFFF),
-                         (unsigned long long)(v2 & 0xFFFFF),
-                         (unsigned long long)((v2 >> 20) & 0xFFFFF));
-              }
-              int t1 = -1;
-              if (notify_register_check("xyz.regulad.geoshim.xpc", &t1) == NOTIFY_STATUS_OK) {
-                  uint64_t v1 = 0;
-                  notify_get_state(t1, &v1);
-                  notify_cancel(t1);
-                  char kname[17], mname[17];
-                  gs_unpack16("xyz.regulad.geoshim.keya", "xyz.regulad.geoshim.keyb", kname);
-                  gs_unpack16("xyz.regulad.geoshim.msga", "xyz.regulad.geoshim.msgb", mname);
-                  printf("  xpc match:   hits=%llu fn=%u bplist=%u be=%u blob_len=%llu lat_off=%llu lon_off=%llu key=[%s] msg=[%s]\\n",
-                         (unsigned long long)(v1 & 0xFFFF),
-                         (unsigned)((v1 >> 56) & 0x7),
-                         (unsigned)((v1 >> 59) & 1),
-                         (unsigned)((v1 >> 60) & 1),
-                         (unsigned long long)((v1 >> 16) & 0xFFFF),
-                         (unsigned long long)((v1 >> 32) & 0xFFF),
-                         (unsigned long long)((v1 >> 44) & 0xFFF),
-                         kname, mname);
+              int xt = -1;
+              if (notify_register_check("xyz.regulad.geoshim.xpc", &xt) == NOTIFY_STATUS_OK) {
+                  uint64_t xv = 0;
+                  notify_get_state(xt, &xv);
+                  notify_cancel(xt);
+                  printf("  xpc rewrite: alive=%u hooks=%u/%u/%u blobs=%llu pairs=%llu\\n",
+                         (unsigned)((xv >> 63) & 1),
+                         (unsigned)((xv >> 62) & 1),
+                         (unsigned)((xv >> 61) & 1),
+                         (unsigned)((xv >> 60) & 1),
+                         (unsigned long long)((xv >> 20) & 0xFFFFF),
+                         (unsigned long long)(xv & 0xFFFFF));
               }
           }
 
@@ -534,8 +505,8 @@ jobs:
           shutil.rmtree("layout/Library/PreferenceLoader", ignore_errors=True)
 
           assert plistlib.load(open("GeoShim.plist", "rb")) == {"Filter": {"Executables": ["locationd"]}}
-          assert "gs_find_coord_pair" in open("Tweak.x").read()
-          assert "real coord:" in open("cli/main.m").read()
+          assert "gs_make_patched_blob" in open("Tweak.x").read()
+          assert "xpc rewrite:" in open("cli/main.m").read()
           print("patch ok")
           PY
 
@@ -580,8 +551,8 @@ jobs:
           [ "$(dpkg-deb -f "$DEB" Architecture)" = "iphoneos-arm64e" ] || { echo "bad package arch"; exit 1; }
           dpkg-deb -c "$DEB" | grep -E 'GeoShim\.dylib$|/geoshim$'
           rm -rf /tmp/debx && dpkg-deb -x "$DEB" /tmp/debx
-          strings /tmp/debx/Library/MobileSubstrate/DynamicLibraries/GeoShim.dylib | grep -q "regulad.geoshim.keya" || { echo "xpc probe v2 missing in dylib"; exit 1; }
-          strings /tmp/debx/usr/local/bin/geoshim | grep -q "real coord:" || { echo "xpc v2 output missing in cli"; exit 1; }
+          strings /tmp/debx/Library/MobileSubstrate/DynamicLibraries/GeoShim.dylib | grep -q "regulad.geoshim.xpc" || { echo "xpc rewriter missing in dylib"; exit 1; }
+          strings /tmp/debx/usr/local/bin/geoshim | grep -q "xpc rewrite:" || { echo "xpc rewrite output missing in cli"; exit 1; }
           python3 -c 'import plistlib; p=plistlib.load(open("/tmp/debx/Library/MobileSubstrate/DynamicLibraries/GeoShim.plist","rb")); assert p=={"Filter":{"Executables":["locationd"]}}, p; print("filter ok")'
 
       - name: Save .deb file
