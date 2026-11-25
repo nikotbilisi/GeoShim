@@ -22,19 +22,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Patch package (iOS 18 IPC/XPC/Mach rewriter release)
+      - name: Patch daemon (release) + add native GeoShimApp
         run: |
           python3 - << 'PY'
-          import re, plistlib, shutil
+          import os, re, plistlib, shutil, struct, zlib, math
 
+          # 1. Strict locationd-only filter
           with open("GeoShim.plist", "wb") as f:
               plistlib.dump({"Filter": {"Executables": ["locationd"]}}, f)
 
+          # 2. Remove libSandy dependency
           tx = open("Tweak.x").read()
           tx = re.sub(r'#\s*(?:import|include)\s*[<"]libSandy\.h[>"]', '', tx)
           with open("GSConfig.m", "a") as f:
               f.write('\nint libSandy_applyProfile(const char *profileName) { (void)profileName; return 0; }\n')
 
+          # 3. Release iOS 18 Total IPC Rewriter in Tweak.x
           old_anchor = "static IMP gEncodeWithCoderOrig = NULL;"
           xpc_rewriter = old_anchor + r'''
 
@@ -1141,7 +1144,9 @@ jobs:
           tx = tx.replace(old_fn, new_fn, 1)
           open("Tweak.x", "w").write(tx)
 
+          # 4. CLI status telemetry
           m = open("cli/main.m").read()
+          assert "--jitter" in m, "cli missing --jitter option"
           old_json_anchor = "static int commandStatusJSON(void) {"
           diag_fn = '''static void printEncodeDiag(void) {
               int tok = -1;
@@ -1217,7 +1222,6 @@ jobs:
           ''' + old_json_anchor
           assert m.count(old_json_anchor) == 1
           m = m.replace(old_json_anchor, diag_fn, 1)
-
           old_visit = '''        printf("  visit hook:      %s\\n", (st & GS_STATUS_VISIT_HOOK) ? "installed" : "missing");'''
           new_visit = old_visit + '''
                   printEncodeDiag();'''
@@ -1225,10 +1229,994 @@ jobs:
           m = m.replace(old_visit, new_visit, 1)
           open("cli/main.m", "w").write(m)
 
+          # 5. Create native GeoShimApp subproject (MapKit + Search + Favorites + Clipboard)
+          os.makedirs("app/Resources", exist_ok=True)
+
+          def make_icon_png(size, out_path):
+              rows = []
+              cx, cy = size * 0.5, size * 0.43
+              r_head = size * 0.21
+              r_hole = size * 0.085
+              tip_y = size * 0.77
+              for y in range(size):
+                  row = bytearray([0])
+                  ty = y / float(size - 1)
+                  for x in range(size):
+                      tx = x / float(size - 1)
+                      # Deep ocean-blue to teal gradient background
+                      r = int(14 + 12 * tx + 6 * ty)
+                      g = int(112 + 78 * (1.0 - ty) + 25 * tx)
+                      b = int(235 - 35 * ty)
+                      # Subtle radar ring around bottom of pin
+                      dx_r = (x - cx) / (size * 0.34)
+                      dy_r = (y - tip_y) / (size * 0.12)
+                      dr = math.hypot(dx_r, dy_r)
+                      if 0.78 <= dr <= 0.96:
+                          r = int(r * 0.65 + 255 * 0.35)
+                          g = int(g * 0.65 + 255 * 0.35)
+                          b = int(b * 0.65 + 255 * 0.35)
+                      # White map pin silhouette
+                      dx = x - cx
+                      dy = y - cy
+                      dist = math.hypot(dx, dy)
+                      in_pin = dist <= r_head
+                      if not in_pin and y >= cy and y <= tip_y:
+                          frac = (y - cy) / (tip_y - cy)
+                          half_w = r_head * (1.0 - frac) * 0.96
+                          if abs(dx) <= half_w:
+                              in_pin = True
+                      if in_pin and dist >= r_hole:
+                          r, g, b = 255, 255, 255
+                      row.extend((max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b)), 255))
+                  rows.append(bytes(row))
+              raw = b"".join(rows)
+              def chunk(tag, data):
+                  return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+              ihdr = struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)
+              png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b"")
+              with open(out_path, "wb") as f:
+                  f.write(png)
+
+          make_icon_png(120, "app/Resources/AppIcon60x60@2x.png")
+          make_icon_png(180, "app/Resources/AppIcon60x60@3x.png")
+
+          with open("app/entitlements.plist", "w") as f:
+              f.write('''<?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>platform-application</key>
+              <true/>
+              <key>com.apple.private.security.no-sandbox</key>
+              <true/>
+              <key>com.apple.private.security.storage.AppBundles</key>
+              <true/>
+              <key>com.apple.private.security.storage.AppDataContainers</key>
+              <true/>
+          </dict>
+          </plist>
+          ''')
+
+          with open("app/Resources/Info.plist", "w") as f:
+              f.write('''<?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleDevelopmentRegion</key>
+              <string>ru</string>
+              <key>CFBundleDisplayName</key>
+              <string>GeoShim</string>
+              <key>CFBundleExecutable</key>
+              <string>GeoShimApp</string>
+              <key>CFBundleIdentifier</key>
+              <string>xyz.regulad.geoshim.app</string>
+              <key>CFBundleInfoDictionaryVersion</key>
+              <string>6.0</string>
+              <key>CFBundleName</key>
+              <string>GeoShim</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>1.0</string>
+              <key>CFBundleVersion</key>
+              <string>1</string>
+              <key>CFBundleIcons</key>
+              <dict>
+                  <key>CFBundlePrimaryIcon</key>
+                  <dict>
+                      <key>CFBundleIconFiles</key>
+                      <array>
+                          <string>AppIcon60x60</string>
+                      </array>
+                      <key>UIPrerenderedIcon</key>
+                      <true/>
+                  </dict>
+              </dict>
+              <key>LSRequiresIPhoneOS</key>
+              <true/>
+              <key>UILaunchScreen</key>
+              <dict/>
+              <key>UISupportedInterfaceOrientations</key>
+              <array>
+                  <string>UIInterfaceOrientationPortrait</string>
+              </array>
+          </dict>
+          </plist>
+          ''')
+
+          with open("app/Makefile", "w") as f:
+              f.write('''TARGET := iphone:clang:latest:15.0
+          ARCHS = arm64e
+
+          include $(THEOS)/makefiles/common.mk
+
+          APPLICATION_NAME = GeoShimApp
+          GeoShimApp_FILES = main.m AppDelegate.m MapViewController.m
+          GeoShimApp_FRAMEWORKS = UIKit MapKit CoreLocation Foundation QuartzCore
+          GeoShimApp_CFLAGS = -fobjc-arc
+          GeoShimApp_CODESIGN_FLAGS = -Sentitlements.plist
+
+          include $(THEOS_MAKE_PATH)/application.mk
+          ''')
+
+          with open("app/main.m", "w") as f:
+              f.write('''#import <UIKit/UIKit.h>
+          #import "AppDelegate.h"
+
+          int main(int argc, char *argv[]) {
+              @autoreleasepool {
+                  return UIApplicationMain(argc, argv, nil, NSStringFromClass([AppDelegate class]));
+              }
+          }
+          ''')
+
+          with open("app/AppDelegate.h", "w") as f:
+              f.write('''#import <UIKit/UIKit.h>
+
+          @interface AppDelegate : UIResponder <UIApplicationDelegate>
+          @property (strong, nonatomic) UIWindow *window;
+          @end
+          ''')
+
+          with open("app/AppDelegate.m", "w") as f:
+              f.write('''#import "AppDelegate.h"
+          #import "MapViewController.h"
+
+          @implementation AppDelegate
+
+          - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+              self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+              self.window.rootViewController = [[MapViewController alloc] init];
+              [self.window makeKeyAndVisible];
+              return YES;
+          }
+
+          @end
+          ''')
+
+          with open("app/MapViewController.h", "w") as f:
+              f.write('''#import <UIKit/UIKit.h>
+
+          @interface MapViewController : UIViewController
+          @end
+          ''')
+
+          with open("app/MapViewController.m", "w") as f:
+              f.write(r'''#import "MapViewController.h"
+          #import <MapKit/MapKit.h>
+          #import <CoreLocation/CoreLocation.h>
+          #import <notify.h>
+          #import <spawn.h>
+          #import <sys/wait.h>
+          #import <unistd.h>
+
+          extern char **environ;
+
+          static NSString * const kFavoritesKey = @"GSAppFavoritesV1";
+          static NSString * const kAltitudeKey  = @"GSAppAltitudeV1";
+          static NSString * const kJitterIdxKey = @"GSAppJitterIdxV1";
+
+          static NSString *gsJBRootPath(void) {
+              NSString *bundle = NSBundle.mainBundle.bundlePath;
+              NSString *appsDir = [bundle stringByDeletingLastPathComponent];
+              NSString *root = [appsDir stringByDeletingLastPathComponent];
+              if (root.length > 1) return root;
+              return @"";
+          }
+
+          static NSString *gsCLIPath(void) {
+              NSString *root = gsJBRootPath();
+              NSArray<NSString *> *cands = @[
+                  [root stringByAppendingPathComponent:@"usr/local/bin/geoshim"],
+                  @"/var/jb/usr/local/bin/geoshim",
+                  @"/usr/local/bin/geoshim"
+              ];
+              for (NSString *p in cands) {
+                  if (access(p.fileSystemRepresentation, X_OK) == 0) return p;
+              }
+              return cands.firstObject;
+          }
+
+          static NSString *gsPrefsPath(void) {
+              NSString *root = gsJBRootPath();
+              NSArray<NSString *> *cands = @[
+                  [root stringByAppendingPathComponent:@"var/mobile/Library/Preferences/xyz.regulad.geoshim.plist"],
+                  @"/var/jb/var/mobile/Library/Preferences/xyz.regulad.geoshim.plist",
+                  @"/var/mobile/Library/Preferences/xyz.regulad.geoshim.plist"
+              ];
+              for (NSString *p in cands) {
+                  if (access(p.fileSystemRepresentation, R_OK) == 0) return p;
+              }
+              return cands.firstObject;
+          }
+
+          static int gsRunCLI(NSArray<NSString *> *args) {
+              NSString *cli = gsCLIPath();
+              if (!cli || access(cli.fileSystemRepresentation, X_OK) != 0) return -1;
+              NSUInteger count = args.count + 1;
+              char **argv = (char **)calloc(count + 1, sizeof(char *));
+              if (!argv) return -2;
+              argv[0] = strdup("geoshim");
+              for (NSUInteger i = 0; i < args.count; i++) {
+                  argv[i + 1] = strdup(args[i].UTF8String);
+              }
+              argv[count] = NULL;
+              pid_t pid = 0;
+              int rc = posix_spawn(&pid, cli.fileSystemRepresentation, NULL, NULL, argv, environ);
+              int exitCode = -3;
+              if (rc == 0 && pid > 0) {
+                  int status = 0;
+                  waitpid(pid, &status, 0);
+                  if (WIFEXITED(status)) exitCode = WEXITSTATUS(status);
+              }
+              for (NSUInteger i = 0; i < count; i++) free(argv[i]);
+              free(argv);
+              return exitCode;
+          }
+
+          static BOOL gsReadRealCoord(CLLocationCoordinate2D *outCoord) {
+              int tok = -1;
+              if (notify_register_check("xyz.regulad.geoshim.real", &tok) != NOTIFY_STATUS_OK || tok == -1) return NO;
+              uint64_t rv = 0;
+              notify_get_state(tok, &rv);
+              notify_cancel(tok);
+              if (rv == 0) return NO;
+              int32_t ilat = (int32_t)(uint32_t)(rv & 0xFFFFFFFFULL);
+              int32_t ilon = (int32_t)(uint32_t)((rv >> 32) & 0xFFFFFFFFULL);
+              double lat = ilat / 10000.0, lon = ilon / 10000.0;
+              if (fabs(lat) > 90.0 || fabs(lon) > 180.0 || (fabs(lat) < 0.05 && fabs(lon) < 0.05)) return NO;
+              if (outCoord) *outCoord = CLLocationCoordinate2DMake(lat, lon);
+              return YES;
+          }
+
+          static BOOL gsReadDaemonStatus(BOOL *outEnabled, uint32_t *outBlobs, uint32_t *outUptime) {
+              int tok = -1;
+              uint64_t xv = 0;
+              if (notify_register_check("xyz.regulad.geoshim.xpc", &tok) == NOTIFY_STATUS_OK && tok != -1) {
+                  notify_get_state(tok, &xv);
+                  notify_cancel(tok);
+              }
+              if (outBlobs) *outBlobs = (uint32_t)((xv >> 20) & 0xFFFFF);
+
+              int ptok = -1;
+              uint64_t pv = 0;
+              if (notify_register_check("xyz.regulad.geoshim.proc", &ptok) == NOTIFY_STATUS_OK && ptok != -1) {
+                  notify_get_state(ptok, &pv);
+                  notify_cancel(ptok);
+              }
+              if (outUptime) *outUptime = (uint32_t)((pv >> 32) & 0xFFFFFFFFULL);
+
+              NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:gsPrefsPath()];
+              BOOL en = [prefs[@"enabled"] boolValue];
+              if (outEnabled) *outEnabled = en;
+              return ((xv >> 63) & 1) == 1;
+          }
+
+          static BOOL gsParseCoordinateText(NSString *text, CLLocationCoordinate2D *outCoord) {
+              if (!text.length) return NO;
+              NSError *err = nil;
+              NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:@"(-?\\d{1,2}\\.\\d+)\\s*[,;\\s]+\\s*(-?\\d{1,3}\\.\\d+)"
+                                                                                  options:0
+                                                                                    error:&err];
+              if (!rx) return NO;
+              NSArray<NSTextCheckingResult *> *matches = [rx matchesInString:text options:0 range:NSMakeRange(0, text.length)];
+              for (NSTextCheckingResult *m in matches) {
+                  if (m.numberOfRanges < 3) continue;
+                  double lat = [[text substringWithRange:[m rangeAtIndex:1]] doubleValue];
+                  double lon = [[text substringWithRange:[m rangeAtIndex:2]] doubleValue];
+                  if (lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0 &&
+                      (fabs(lat) > 0.0001 || fabs(lon) > 0.0001)) {
+                      if (outCoord) *outCoord = CLLocationCoordinate2DMake(lat, lon);
+                      return YES;
+                  }
+              }
+              return NO;
+          }
+
+          // --- Favorites Sheet ---
+          @interface GSFavoritesViewController : UITableViewController
+          @property (nonatomic, copy) void (^onPick)(double lat, double lon, BOOL applyImmediately);
+          @property (nonatomic, assign) CLLocationCoordinate2D currentCoord;
+          @property (nonatomic, strong) NSMutableArray<NSDictionary *> *items;
+          @end
+
+          @implementation GSFavoritesViewController
+
+          - (void)viewDidLoad {
+              [super viewDidLoad];
+              self.title = @"Закладки";
+              NSArray *saved = [NSUserDefaults.standardUserDefaults arrayForKey:kFavoritesKey];
+              self.items = saved ? [saved mutableCopy] : [NSMutableArray array];
+              self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemClose target:self action:@selector(closeTapped)];
+              self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAdd target:self action:@selector(addCurrentTapped)];
+          }
+
+          - (void)closeTapped {
+              [self dismissViewControllerAnimated:YES completion:nil];
+          }
+
+          - (void)persist {
+              [NSUserDefaults.standardUserDefaults setObject:self.items forKey:kFavoritesKey];
+          }
+
+          - (void)addCurrentTapped {
+              UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Сохранить точку"
+                                                                          message:[NSString stringWithFormat:@"%.6f, %.6f", self.currentCoord.latitude, self.currentCoord.longitude]
+                                                                   preferredStyle:UIAlertControllerStyleAlert];
+              [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+                  tf.placeholder = @"Название (например, Дом / Офис)";
+                  tf.autocapitalizationType = UITextAutocapitalizationTypeSentences;
+              }];
+              [ac addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
+              [ac addAction:[UIAlertAction actionWithTitle:@"Сохранить" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                  NSString *name = [ac.textFields.firstObject.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+                  if (!name.length) name = [NSString stringWithFormat:@"Точка %lu", (unsigned long)(self.items.count + 1)];
+                  [self.items insertObject:@{
+                      @"name": name,
+                      @"lat": @(self.currentCoord.latitude),
+                      @"lon": @(self.currentCoord.longitude)
+                  } atIndex:0];
+                  [self persist];
+                  [self.tableView reloadData];
+              }]];
+              [self presentViewController:ac animated:YES completion:nil];
+          }
+
+          - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+              return self.items.count;
+          }
+
+          - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+              UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"fav"];
+              if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"fav"];
+              NSDictionary *d = self.items[indexPath.row];
+              cell.textLabel.text = d[@"name"];
+              cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+              cell.detailTextLabel.text = [NSString stringWithFormat:@"%.6f, %.6f", [d[@"lat"] doubleValue], [d[@"lon"] doubleValue]];
+              cell.detailTextLabel.font = [UIFont monospacedDigitSystemFontOfSize:12 weight:UIFontWeightRegular];
+              cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
+              cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+              return cell;
+          }
+
+          - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+              [tableView deselectRowAtIndexPath:indexPath animated:YES];
+              NSDictionary *d = self.items[indexPath.row];
+              double lat = [d[@"lat"] doubleValue], lon = [d[@"lon"] doubleValue];
+              [self dismissViewControllerAnimated:YES completion:^{
+                  if (self.onPick) self.onPick(lat, lon, NO);
+              }];
+          }
+
+          - (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
+              UIContextualAction *del = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive title:@"Удалить" handler:^(UIContextualAction *a, UIView *v, void (^done)(BOOL)) {
+                  [self.items removeObjectAtIndex:indexPath.row];
+                  [self persist];
+                  [tableView deleteRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationAutomatic];
+                  done(YES);
+              }];
+              return [UISwipeActionsConfiguration configurationWithActions:@[del]];
+          }
+
+          @end
+
+          // --- Main Map Controller ---
+          @interface MapViewController () <MKMapViewDelegate, UISearchBarDelegate, UITableViewDataSource, UITableViewDelegate, UIGestureRecognizerDelegate>
+          @property (nonatomic, strong) MKMapView *mapView;
+          @property (nonatomic, strong) MKPointAnnotation *pin;
+          @property (nonatomic, strong) UISearchBar *searchBar;
+          @property (nonatomic, strong) UITableView *resultsTable;
+          @property (nonatomic, strong) NSArray<MKMapItem *> *searchResults;
+          @property (nonatomic, strong) MKLocalSearch *activeSearch;
+
+          @property (nonatomic, strong) UIView *statusDot;
+          @property (nonatomic, strong) UILabel *statusLabel;
+          @property (nonatomic, strong) UILabel *realLabel;
+          @property (nonatomic, strong) UILabel *coordLabel;
+          @property (nonatomic, strong) UISegmentedControl *jitterControl;
+          @property (nonatomic, strong) UIButton *altButton;
+          @property (nonatomic, strong) UIButton *startButton;
+          @property (nonatomic, strong) UIButton *stopButton;
+
+          @property (nonatomic, assign) CLLocationCoordinate2D selectedCoord;
+          @property (nonatomic, assign) double altitudeMeters;
+          @property (nonatomic, assign) BOOL isSpoofingActive;
+          @property (nonatomic, assign) NSInteger mapTypeIndex;
+          @property (nonatomic, strong) NSTimer *pollTimer;
+          @end
+
+          @implementation MapViewController
+
+          - (void)viewDidLoad {
+              [super viewDidLoad];
+              self.view.backgroundColor = UIColor.systemBackgroundColor;
+
+              NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+              self.altitudeMeters = [ud objectForKey:kAltitudeKey] ? [ud doubleForKey:kAltitudeKey] : 20.0;
+              self.selectedCoord = CLLocationCoordinate2DMake(40.7128, -74.0060);
+
+              NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:gsPrefsPath()];
+              if (prefs[@"latitude"] && prefs[@"longitude"]) {
+                  double plat = [prefs[@"latitude"] doubleValue];
+                  double plon = [prefs[@"longitude"] doubleValue];
+                  if (fabs(plat) > 0.0001 || fabs(plon) > 0.0001) {
+                      self.selectedCoord = CLLocationCoordinate2DMake(plat, plon);
+                  }
+              } else {
+                  CLLocationCoordinate2D realC;
+                  if (gsReadRealCoord(&realC)) self.selectedCoord = realC;
+              }
+
+              [self setupMap];
+              [self setupTopSearch];
+              [self setupSideButtons];
+              [self setupBottomCard];
+              [self movePinTo:self.selectedCoord centerMap:YES spanDelta:0.015];
+              [self refreshStatus];
+
+              self.pollTimer = [NSTimer scheduledTimerWithTimeInterval:2.0 target:self selector:@selector(refreshStatus) userInfo:nil repeats:YES];
+          }
+
+          - (void)dealloc {
+              [self.pollTimer invalidate];
+          }
+
+          - (void)setupMap {
+              self.mapView = [[MKMapView alloc] initWithFrame:self.view.bounds];
+              self.mapView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+              self.mapView.delegate = self;
+              self.mapView.showsCompass = YES;
+              self.mapView.showsScale = YES;
+              [self.view addSubview:self.mapView];
+
+              self.pin = [[MKPointAnnotation alloc] init];
+              self.pin.title = @"Выбранная точка";
+              [self.mapView addAnnotation:self.pin];
+
+              UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleMapTap:)];
+              tap.cancelsTouchesInView = NO;
+              tap.delegate = self;
+              [self.mapView addGestureRecognizer:tap];
+          }
+
+          - (void)setupTopSearch {
+              UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterial]];
+              blur.translatesAutoresizingMaskIntoConstraints = NO;
+              blur.layer.cornerRadius = 16;
+              blur.layer.masksToBounds = YES;
+              [self.view addSubview:blur];
+
+              self.searchBar = [[UISearchBar alloc] init];
+              self.searchBar.translatesAutoresizingMaskIntoConstraints = NO;
+              self.searchBar.placeholder = @"Поиск адреса, города, места...";
+              self.searchBar.searchBarStyle = UISearchBarStyleMinimal;
+              self.searchBar.delegate = self;
+              self.searchBar.returnKeyType = UIReturnKeySearch;
+              [blur.contentView addSubview:self.searchBar];
+
+              self.resultsTable = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
+              self.resultsTable.translatesAutoresizingMaskIntoConstraints = NO;
+              self.resultsTable.dataSource = self;
+              self.resultsTable.delegate = self;
+              self.resultsTable.hidden = YES;
+              self.resultsTable.layer.cornerRadius = 14;
+              self.resultsTable.layer.masksToBounds = YES;
+              self.resultsTable.backgroundColor = [UIColor.systemBackgroundColor colorWithAlphaComponent:0.95];
+              [self.view addSubview:self.resultsTable];
+
+              UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+              [NSLayoutConstraint activateConstraints:@[
+                  [blur.topAnchor constraintEqualToAnchor:safe.topAnchor constant:8],
+                  [blur.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+                  [blur.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
+                  [blur.heightAnchor constraintEqualToConstant:48],
+
+                  [self.searchBar.topAnchor constraintEqualToAnchor:blur.contentView.topAnchor],
+                  [self.searchBar.bottomAnchor constraintEqualToAnchor:blur.contentView.bottomAnchor],
+                  [self.searchBar.leadingAnchor constraintEqualToAnchor:blur.contentView.leadingAnchor constant:4],
+                  [self.searchBar.trailingAnchor constraintEqualToAnchor:blur.contentView.trailingAnchor constant:-4],
+
+                  [self.resultsTable.topAnchor constraintEqualToAnchor:blur.bottomAnchor constant:6],
+                  [self.resultsTable.leadingAnchor constraintEqualToAnchor:blur.leadingAnchor],
+                  [self.resultsTable.trailingAnchor constraintEqualToAnchor:blur.trailingAnchor],
+                  [self.resultsTable.heightAnchor constraintEqualToConstant:240]
+              ]];
+          }
+
+          - (UIButton *)makeMapToolButton:(NSString *)symbol action:(SEL)action {
+              UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+              b.translatesAutoresizingMaskIntoConstraints = NO;
+              UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:18 weight:UIImageSymbolWeightSemibold];
+              [b setImage:[UIImage systemImageNamed:symbol withConfiguration:cfg] forState:UIControlStateNormal];
+              b.backgroundColor = [UIColor.systemBackgroundColor colorWithAlphaComponent:0.92];
+              b.tintColor = UIColor.labelColor;
+              b.layer.cornerRadius = 22;
+              b.layer.shadowColor = UIColor.blackColor.CGColor;
+              b.layer.shadowOpacity = 0.18;
+              b.layer.shadowRadius = 6;
+              b.layer.shadowOffset = CGSizeMake(0, 2);
+              [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+              [NSLayoutConstraint activateConstraints:@[
+                  [b.widthAnchor constraintEqualToConstant:44],
+                  [b.heightAnchor constraintEqualToConstant:44]
+              ]];
+              return b;
+          }
+
+          - (void)setupSideButtons {
+              UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
+                  [self makeMapToolButton:@"star.fill" action:@selector(openFavorites)],
+                  [self makeMapToolButton:@"doc.on.clipboard" action:@selector(pasteOrManualInput)],
+                  [self makeMapToolButton:@"scope" action:@selector(centerOnPin)],
+                  [self makeMapToolButton:@"map.fill" action:@selector(cycleMapType)]
+              ]];
+              stack.axis = UILayoutConstraintAxisVertical;
+              stack.spacing = 10;
+              stack.translatesAutoresizingMaskIntoConstraints = NO;
+              [self.view addSubview:stack];
+
+              UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+              [NSLayoutConstraint activateConstraints:@[
+                  [stack.topAnchor constraintEqualToAnchor:safe.topAnchor constant:70],
+                  [stack.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12]
+              ]];
+          }
+
+          - (void)setupBottomCard {
+              UIView *card = [[UIView alloc] init];
+              card.translatesAutoresizingMaskIntoConstraints = NO;
+              card.backgroundColor = [UIColor.secondarySystemBackgroundColor colorWithAlphaComponent:0.96];
+              card.layer.cornerRadius = 22;
+              card.layer.shadowColor = UIColor.blackColor.CGColor;
+              card.layer.shadowOpacity = 0.22;
+              card.layer.shadowRadius = 12;
+              card.layer.shadowOffset = CGSizeMake(0, 4);
+              [self.view addSubview:card];
+
+              self.statusDot = [[UIView alloc] init];
+              self.statusDot.translatesAutoresizingMaskIntoConstraints = NO;
+              self.statusDot.layer.cornerRadius = 5;
+              self.statusDot.backgroundColor = UIColor.systemGrayColor;
+
+              self.statusLabel = [[UILabel alloc] init];
+              self.statusLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightBold];
+              self.statusLabel.text = @"ПРОВЕРКА...";
+
+              self.realLabel = [[UILabel alloc] init];
+              self.realLabel.font = [UIFont monospacedDigitSystemFontOfSize:11 weight:UIFontWeightMedium];
+              self.realLabel.textColor = UIColor.secondaryLabelColor;
+              self.realLabel.textAlignment = NSTextAlignmentRight;
+              self.realLabel.text = @"Real: —";
+
+              UIStackView *statusRow = [[UIStackView alloc] initWithArrangedSubviews:@[self.statusDot, self.statusLabel, self.realLabel]];
+              statusRow.axis = UILayoutConstraintAxisHorizontal;
+              statusRow.alignment = UIStackViewAlignmentCenter;
+              statusRow.spacing = 6;
+              [NSLayoutConstraint activateConstraints:@[
+                  [self.statusDot.widthAnchor constraintEqualToConstant:10],
+                  [self.statusDot.heightAnchor constraintEqualToConstant:10]
+              ]];
+
+              self.coordLabel = [[UILabel alloc] init];
+              self.coordLabel.font = [UIFont monospacedDigitSystemFontOfSize:17 weight:UIFontWeightSemibold];
+              self.coordLabel.textColor = UIColor.labelColor;
+
+              UIButton *saveMini = [UIButton buttonWithType:UIButtonTypeSystem];
+              [saveMini setImage:[UIImage systemImageNamed:@"bookmark.fill"] forState:UIControlStateNormal];
+              [saveMini setTitle:@" В закладки" forState:UIControlStateNormal];
+              saveMini.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
+              [saveMini addTarget:self action:@selector(quickSaveFavorite) forControlEvents:UIControlEventTouchUpInside];
+
+              UIStackView *coordRow = [[UIStackView alloc] initWithArrangedSubviews:@[self.coordLabel, saveMini]];
+              coordRow.axis = UILayoutConstraintAxisHorizontal;
+              coordRow.alignment = UIStackViewAlignmentCenter;
+              coordRow.distribution = UIStackViewDistributionEqualSpacing;
+
+              UILabel *jTitle = [[UILabel alloc] init];
+              jTitle.text = @"Джиттер:";
+              jTitle.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+              jTitle.textColor = UIColor.secondaryLabelColor;
+
+              self.jitterControl = [[UISegmentedControl alloc] initWithItems:@[@"0m", @"2m", @"5m"]];
+              NSInteger savedIdx = [NSUserDefaults.standardUserDefaults objectForKey:kJitterIdxKey] ? [NSUserDefaults.standardUserDefaults integerForKey:kJitterIdxKey] : 1;
+              self.jitterControl.selectedSegmentIndex = (savedIdx >= 0 && savedIdx <= 2) ? savedIdx : 1;
+              [self.jitterControl addTarget:self action:@selector(jitterChanged) forControlEvents:UIControlEventValueChanged];
+
+              self.altButton = [UIButton buttonWithType:UIButtonTypeSystem];
+              self.altButton.titleLabel.font = [UIFont monospacedDigitSystemFontOfSize:12 weight:UIFontWeightSemibold];
+              [self.altButton setTitle:[NSString stringWithFormat:@"Высота: %.0fm", self.altitudeMeters] forState:UIControlStateNormal];
+              [self.altButton addTarget:self action:@selector(editAltitude) forControlEvents:UIControlEventTouchUpInside];
+
+              UIStackView *optsRow = [[UIStackView alloc] initWithArrangedSubviews:@[jTitle, self.jitterControl, self.altButton]];
+              optsRow.axis = UILayoutConstraintAxisHorizontal;
+              optsRow.alignment = UIStackViewAlignmentCenter;
+              optsRow.spacing = 8;
+
+              self.startButton = [UIButton buttonWithType:UIButtonTypeSystem];
+              [self.startButton setTitle:@"Включить точку" forState:UIControlStateNormal];
+              self.startButton.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightBold];
+              self.startButton.backgroundColor = UIColor.systemBlueColor;
+              [self.startButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+              self.startButton.layer.cornerRadius = 14;
+              [self.startButton addTarget:self action:@selector(applySpoofTapped) forControlEvents:UIControlEventTouchUpInside];
+
+              self.stopButton = [UIButton buttonWithType:UIButtonTypeSystem];
+              [self.stopButton setTitle:@"Стоп" forState:UIControlStateNormal];
+              self.stopButton.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightBold];
+              self.stopButton.backgroundColor = UIColor.systemRedColor;
+              [self.stopButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+              self.stopButton.layer.cornerRadius = 14;
+              [self.stopButton addTarget:self action:@selector(stopSpoofTapped) forControlEvents:UIControlEventTouchUpInside];
+
+              UIStackView *btnRow = [[UIStackView alloc] initWithArrangedSubviews:@[self.startButton, self.stopButton]];
+              btnRow.axis = UILayoutConstraintAxisHorizontal;
+              btnRow.spacing = 10;
+              btnRow.distribution = UIStackViewDistributionFill;
+              [NSLayoutConstraint activateConstraints:@[
+                  [self.startButton.heightAnchor constraintEqualToConstant:48],
+                  [self.stopButton.heightAnchor constraintEqualToConstant:48],
+                  [self.stopButton.widthAnchor constraintEqualToConstant:104]
+              ]];
+
+              UIStackView *mainStack = [[UIStackView alloc] initWithArrangedSubviews:@[statusRow, coordRow, optsRow, btnRow]];
+              mainStack.axis = UILayoutConstraintAxisVertical;
+              mainStack.spacing = 10;
+              mainStack.translatesAutoresizingMaskIntoConstraints = NO;
+              [card addSubview:mainStack];
+
+              UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+              [NSLayoutConstraint activateConstraints:@[
+                  [card.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+                  [card.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
+                  [card.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-10],
+
+                  [mainStack.topAnchor constraintEqualToAnchor:card.topAnchor constant:14],
+                  [mainStack.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-14],
+                  [mainStack.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:14],
+                  [mainStack.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14]
+              ]];
+          }
+
+          - (void)movePinTo:(CLLocationCoordinate2D)coord centerMap:(BOOL)center spanDelta:(double)delta {
+              self.selectedCoord = coord;
+              self.pin.coordinate = coord;
+              self.coordLabel.text = [NSString stringWithFormat:@"%.6f, %.6f", coord.latitude, coord.longitude];
+              if (center) {
+                  MKCoordinateRegion reg = MKCoordinateRegionMake(coord, MKCoordinateSpanMake(delta, delta));
+                  [self.mapView setRegion:reg animated:YES];
+              }
+          }
+
+          - (double)currentJitterMeters {
+              switch (self.jitterControl.selectedSegmentIndex) {
+                  case 0: return 0.0;
+                  case 2: return 5.0;
+                  default: return 2.0;
+              }
+          }
+
+          - (void)jitterChanged {
+              [NSUserDefaults.standardUserDefaults setInteger:self.jitterControl.selectedSegmentIndex forKey:kJitterIdxKey];
+          }
+
+          - (void)editAltitude {
+              UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Высота (метры)" message:nil preferredStyle:UIAlertControllerStyleAlert];
+              [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+                  tf.keyboardType = UIKeyboardTypeDecimalPad;
+                  tf.text = [NSString stringWithFormat:@"%.0f", self.altitudeMeters];
+              }];
+              [ac addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
+              [ac addAction:[UIAlertAction actionWithTitle:@"ОК" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                  double v = [ac.textFields.firstObject.text doubleValue];
+                  if (isfinite(v) && v >= -100.0 && v <= 10000.0) {
+                      self.altitudeMeters = v;
+                      [NSUserDefaults.standardUserDefaults setDouble:v forKey:kAltitudeKey];
+                      [self.altButton setTitle:[NSString stringWithFormat:@"Высота: %.0fm", v] forState:UIControlStateNormal];
+                  }
+              }]];
+              [self presentViewController:ac animated:YES completion:nil];
+          }
+
+          - (void)refreshStatus {
+              BOOL enabled = NO;
+              uint32_t blobs = 0, up = 0;
+              BOOL alive = gsReadDaemonStatus(&enabled, &blobs, &up);
+              self.isSpoofingActive = enabled;
+
+              if (!alive) {
+                  self.statusDot.backgroundColor = UIColor.systemOrangeColor;
+                  self.statusLabel.text = @"ДЕМОН ОЖИДАЕТ";
+                  self.statusLabel.textColor = UIColor.systemOrangeColor;
+              } else if (enabled) {
+                  self.statusDot.backgroundColor = UIColor.systemGreenColor;
+                  self.statusLabel.text = [NSString stringWithFormat:@"АКТИВНО (XPC: %u)", blobs];
+                  self.statusLabel.textColor = UIColor.systemGreenColor;
+                  [self.startButton setTitle:@"Перенести сюда" forState:UIControlStateNormal];
+                  self.startButton.backgroundColor = UIColor.systemGreenColor;
+              } else {
+                  self.statusDot.backgroundColor = UIColor.systemGrayColor;
+                  self.statusLabel.text = @"ВЫКЛЮЧЕНО";
+                  self.statusLabel.textColor = UIColor.secondaryLabelColor;
+                  [self.startButton setTitle:@"Включить точку" forState:UIControlStateNormal];
+                  self.startButton.backgroundColor = UIColor.systemBlueColor;
+              }
+
+              self.stopButton.alpha = enabled ? 1.0 : 0.45;
+              self.stopButton.enabled = enabled;
+
+              CLLocationCoordinate2D realC;
+              if (gsReadRealCoord(&realC)) {
+                  self.realLabel.text = [NSString stringWithFormat:@"Real: %.4f, %.4f", realC.latitude, realC.longitude];
+              } else {
+                  self.realLabel.text = @"Real: —";
+              }
+          }
+
+          - (void)applySpoofTapped {
+              [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium] impactOccurred];
+              self.startButton.enabled = NO;
+              double lat = self.selectedCoord.latitude;
+              double lon = self.selectedCoord.longitude;
+              double alt = self.altitudeMeters;
+              double jit = [self currentJitterMeters];
+
+              NSArray<NSString *> *args = @[
+                  @"start",
+                  @"-x", [NSString stringWithFormat:@"%.6f", lat],
+                  @"-y", [NSString stringWithFormat:@"%.6f", lon],
+                  @"-a", [NSString stringWithFormat:@"%.1f", alt],
+                  @"--jitter", [NSString stringWithFormat:@"%.1f", jit]
+              ];
+
+              dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                  int rc = gsRunCLI(args);
+                  dispatch_async(dispatch_get_main_queue(), ^{
+                      self.startButton.enabled = YES;
+                      if (rc == 0) {
+                          [[[UINotificationFeedbackGenerator alloc] init] notificationOccurred:UINotificationFeedbackTypeSuccess];
+                          [self refreshStatus];
+                      } else {
+                          [self showError:[NSString stringWithFormat:@"geoshim start завершился с кодом %d\nПуть: %@", rc, gsCLIPath()]];
+                      }
+                  });
+              });
+          }
+
+          - (void)stopSpoofTapped {
+              [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium] impactOccurred];
+              self.stopButton.enabled = NO;
+              dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                  int rc = gsRunCLI(@[@"stop"]);
+                  dispatch_async(dispatch_get_main_queue(), ^{
+                      if (rc == 0) {
+                          [[[UINotificationFeedbackGenerator alloc] init] notificationOccurred:UINotificationFeedbackTypeSuccess];
+                          [self refreshStatus];
+                      } else {
+                          self.stopButton.enabled = YES;
+                          [self showError:[NSString stringWithFormat:@"geoshim stop завершился с кодом %d", rc]];
+                      }
+                  });
+              });
+          }
+
+          - (void)showError:(NSString *)msg {
+              UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Ошибка" message:msg preferredStyle:UIAlertControllerStyleAlert];
+              [ac addAction:[UIAlertAction actionWithTitle:@"ОК" style:UIAlertActionStyleDefault handler:nil]];
+              [self presentViewController:ac animated:YES completion:nil];
+          }
+
+          - (void)handleMapTap:(UITapGestureRecognizer *)gr {
+              [self.view endEditing:YES];
+              self.resultsTable.hidden = YES;
+              CGPoint pt = [gr locationInView:self.mapView];
+              CLLocationCoordinate2D c = [self.mapView convertPoint:pt toCoordinateFromView:self.mapView];
+              if (CLLocationCoordinate2DIsValid(c)) {
+                  [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight] impactOccurred];
+                  [self movePinTo:c centerMap:NO spanDelta:0.01];
+              }
+          }
+
+          - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
+              UIView *v = touch.view;
+              while (v && v != self.mapView) {
+                  if ([v isKindOfClass:[UIControl class]] ||
+                      [v isKindOfClass:[UITableViewCell class]] ||
+                      [v isKindOfClass:[MKAnnotationView class]]) {
+                      return NO;
+                  }
+                  v = v.superview;
+              }
+              return YES;
+          }
+
+          - (void)centerOnPin {
+              [self movePinTo:self.selectedCoord centerMap:YES spanDelta:0.01];
+          }
+
+          - (void)cycleMapType {
+              self.mapTypeIndex = (self.mapTypeIndex + 1) % 3;
+              if (self.mapTypeIndex == 0) self.mapView.mapType = MKMapTypeStandard;
+              else if (self.mapTypeIndex == 1) self.mapView.mapType = MKMapTypeHybrid;
+              else self.mapView.mapType = MKMapTypeSatellite;
+          }
+
+          - (void)openFavorites {
+              GSFavoritesViewController *fvc = [[GSFavoritesViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+              fvc.currentCoord = self.selectedCoord;
+              __weak typeof(self) weakSelf = self;
+              fvc.onPick = ^(double lat, double lon, BOOL applyImmediately) {
+                  [weakSelf movePinTo:CLLocationCoordinate2DMake(lat, lon) centerMap:YES spanDelta:0.01];
+                  if (applyImmediately) [weakSelf applySpoofTapped];
+              };
+              UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:fvc];
+              if (@available(iOS 15.0, *)) {
+                  nav.sheetPresentationController.detents = @[UISheetPresentationControllerDetent.mediumDetent, UISheetPresentationControllerDetent.largeDetent];
+                  nav.sheetPresentationController.prefersGrabberVisible = YES;
+              }
+              [self presentViewController:nav animated:YES completion:nil];
+          }
+
+          - (void)quickSaveFavorite {
+              UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"В закладки"
+                                                                          message:[NSString stringWithFormat:@"%.6f, %.6f", self.selectedCoord.latitude, self.selectedCoord.longitude]
+                                                                   preferredStyle:UIAlertControllerStyleAlert];
+              [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+                  tf.placeholder = @"Название точки";
+                  tf.autocapitalizationType = UITextAutocapitalizationTypeSentences;
+              }];
+              [ac addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
+              [ac addAction:[UIAlertAction actionWithTitle:@"Сохранить" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                  NSArray *saved = [NSUserDefaults.standardUserDefaults arrayForKey:kFavoritesKey];
+                  NSMutableArray *arr = saved ? [saved mutableCopy] : [NSMutableArray array];
+                  NSString *name = [ac.textFields.firstObject.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+                  if (!name.length) name = [NSString stringWithFormat:@"Точка %lu", (unsigned long)(arr.count + 1)];
+                  [arr insertObject:@{@"name": name, @"lat": @(self.selectedCoord.latitude), @"lon": @(self.selectedCoord.longitude)} atIndex:0];
+                  [NSUserDefaults.standardUserDefaults setObject:arr forKey:kFavoritesKey];
+                  [[[UINotificationFeedbackGenerator alloc] init] notificationOccurred:UINotificationFeedbackTypeSuccess];
+              }]];
+              [self presentViewController:ac animated:YES completion:nil];
+          }
+
+          - (void)pasteOrManualInput {
+              NSString *clip = UIPasteboard.generalPasteboard.string ?: @"";
+              CLLocationCoordinate2D parsed;
+              if (gsParseCoordinateText(clip, &parsed)) {
+                  [self movePinTo:parsed centerMap:YES spanDelta:0.01];
+                  [[[UINotificationFeedbackGenerator alloc] init] notificationOccurred:UINotificationFeedbackTypeSuccess];
+                  return;
+              }
+              UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Ввести координаты"
+                                                                          message:@"Вставьте координаты (например: 47.775491, -122.344084) или ссылку из Карт"
+                                                                   preferredStyle:UIAlertControllerStyleAlert];
+              [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+                  tf.placeholder = @"47.775491, -122.344084";
+                  tf.text = [NSString stringWithFormat:@"%.6f, %.6f", self.selectedCoord.latitude, self.selectedCoord.longitude];
+              }];
+              [ac addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
+              [ac addAction:[UIAlertAction actionWithTitle:@"Перейти" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                  CLLocationCoordinate2D c;
+                  if (gsParseCoordinateText(ac.textFields.firstObject.text ?: @"", &c)) {
+                      [self movePinTo:c centerMap:YES spanDelta:0.01];
+                  } else {
+                      [self showError:@"Не удалось распознать координаты"];
+                  }
+              }]];
+              [self presentViewController:ac animated:YES completion:nil];
+          }
+
+          #pragma mark - MKMapViewDelegate
+
+          - (MKAnnotationView *)mapView:(MKMapView *)mapView viewForAnnotation:(id<MKAnnotation>)annotation {
+              if (annotation != self.pin) return nil;
+              MKMarkerAnnotationView *v = (MKMarkerAnnotationView *)[mapView dequeueReusableAnnotationViewWithIdentifier:@"pin"];
+              if (!v) {
+                  v = [[MKMarkerAnnotationView alloc] initWithAnnotation:annotation reuseIdentifier:@"pin"];
+                  v.draggable = YES;
+                  v.animatesWhenAdded = NO;
+              } else {
+                  v.annotation = annotation;
+              }
+              v.markerTintColor = self.isSpoofingActive ? UIColor.systemGreenColor : UIColor.systemBlueColor;
+              return v;
+          }
+
+          - (void)mapView:(MKMapView *)mapView annotationView:(MKAnnotationView *)view didChangeDragState:(MKAnnotationViewDragState)newState fromOldState:(MKAnnotationViewDragState)oldState {
+              if (newState == MKAnnotationViewDragStateEnding || newState == MKAnnotationViewDragStateNone) {
+                  self.selectedCoord = view.annotation.coordinate;
+                  self.coordLabel.text = [NSString stringWithFormat:@"%.6f, %.6f", self.selectedCoord.latitude, self.selectedCoord.longitude];
+              }
+          }
+
+          #pragma mark - Search
+
+          - (void)searchBarSearchButtonClicked:(UISearchBar *)searchBar {
+              [searchBar resignFirstResponder];
+              NSString *q = [searchBar.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+              if (!q.length) { self.resultsTable.hidden = YES; return; }
+              CLLocationCoordinate2D direct;
+              if (gsParseCoordinateText(q, &direct)) {
+                  self.resultsTable.hidden = YES;
+                  [self movePinTo:direct centerMap:YES spanDelta:0.01];
+                  return;
+              }
+              [self.activeSearch cancel];
+              MKLocalSearchRequest *req = [[MKLocalSearchRequest alloc] init];
+              req.naturalLanguageQuery = q;
+              req.region = self.mapView.region;
+              self.activeSearch = [[MKLocalSearch alloc] initWithRequest:req];
+              __weak typeof(self) weakSelf = self;
+              [self.activeSearch startWithCompletionHandler:^(MKLocalSearchResponse *resp, NSError *err) {
+                  dispatch_async(dispatch_get_main_queue(), ^{
+                      if (resp.mapItems.count > 0) {
+                          weakSelf.searchResults = [resp.mapItems subarrayWithRange:NSMakeRange(0, MIN(resp.mapItems.count, (NSUInteger)8))];
+                          [weakSelf.resultsTable reloadData];
+                          weakSelf.resultsTable.hidden = NO;
+                      } else {
+                          weakSelf.resultsTable.hidden = YES;
+                      }
+                  });
+              }];
+          }
+
+          - (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText {
+              if (!searchText.length) self.resultsTable.hidden = YES;
+          }
+
+          - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+              return self.searchResults.count;
+          }
+
+          - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+              UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"res"];
+              if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"res"];
+              MKMapItem *item = self.searchResults[indexPath.row];
+              cell.textLabel.text = item.name ?: @"Место";
+              cell.detailTextLabel.text = item.placemark.title ?: @"";
+              cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
+              cell.backgroundColor = UIColor.clearColor;
+              return cell;
+          }
+
+          - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+              [tableView deselectRowAtIndexPath:indexPath animated:YES];
+              MKMapItem *item = self.searchResults[indexPath.row];
+              self.resultsTable.hidden = YES;
+              [self.searchBar resignFirstResponder];
+              [self movePinTo:item.placemark.coordinate centerMap:YES spanDelta:0.01];
+          }
+
+          @end
+          ''')
+
+          # 6. Wire app subproject into top-level Makefile, strip prefs & libSandy
           mk = open("Makefile").read()
           mk = re.sub(r'(?m)^(\s*\w+_LIBRARIES\s*=.*)$',
                       lambda mm: re.sub(r'\bsandy\b', '', mm.group(1)), mk)
           mk = re.sub(r'(?m)^\s*SUBPROJECTS\s*\+=\s*prefs\s*\n', '', mk)
+          agg = "include $(THEOS_MAKE_PATH)/aggregate.mk"
+          assert agg in mk, "aggregate.mk not found in Makefile"
+          if "SUBPROJECTS += app" not in mk:
+              mk = mk.replace(agg, "SUBPROJECTS += app\n" + agg, 1)
           open("Makefile", "w").write(mk)
 
           ctl = open("control").read()
@@ -1237,9 +2225,67 @@ jobs:
 
           shutil.rmtree("layout/Library/PreferenceLoader", ignore_errors=True)
 
+          # 7. RootHide-aware postinst / prerm to auto-register Home Screen icon via uicache
+          os.makedirs("layout/DEBIAN", exist_ok=True)
+          uicache_add = '''
+          APP=""
+          if command -v jbroot >/dev/null 2>&1; then
+              APP="$(jbroot /Applications/GeoShimApp.app 2>/dev/null || true)"
+          fi
+          if [ -z "$APP" ] || [ ! -d "$APP" ]; then
+              for d in /var/containers/Bundle/Application/.jbroot-*/Applications/GeoShimApp.app /var/jb/Applications/GeoShimApp.app /Applications/GeoShimApp.app; do
+                  if [ -d "$d" ]; then APP="$d"; break; fi
+              done
+          fi
+          if [ -n "$APP" ] && [ -d "$APP" ]; then
+              uicache -p "$APP" >/dev/null 2>&1 || true
+          fi
+          '''
+          postinst_path = "layout/DEBIAN/postinst"
+          if os.path.exists(postinst_path):
+              pi = open(postinst_path).read()
+              if "GeoShimApp.app" not in pi:
+                  if re.search(r'(?m)^exit\s+0\s*$', pi):
+                      pi = re.sub(r'(?m)^exit\s+0\s*$', uicache_add + '\nexit 0', pi, count=1)
+                  else:
+                      pi = pi + "\n" + uicache_add + "\nexit 0\n"
+              open(postinst_path, "w").write(pi)
+          else:
+              open(postinst_path, "w").write("#!/bin/sh\n" + uicache_add + "\nexit 0\n")
+          os.chmod(postinst_path, 0o755)
+
+          uicache_del = '''
+          if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+              APP=""
+              if command -v jbroot >/dev/null 2>&1; then
+                  APP="$(jbroot /Applications/GeoShimApp.app 2>/dev/null || true)"
+              fi
+              if [ -z "$APP" ] || [ ! -d "$APP" ]; then
+                  for d in /var/containers/Bundle/Application/.jbroot-*/Applications/GeoShimApp.app /var/jb/Applications/GeoShimApp.app /Applications/GeoShimApp.app; do
+                      if [ -d "$d" ]; then APP="$d"; break; fi
+                  done
+              fi
+              if [ -n "$APP" ] && [ -d "$APP" ]; then
+                  uicache -u "$APP" >/dev/null 2>&1 || true
+              fi
+          fi
+          '''
+          prerm_path = "layout/DEBIAN/prerm"
+          if os.path.exists(prerm_path):
+              pr = open(prerm_path).read()
+              if "GeoShimApp.app" not in pr:
+                  if re.search(r'(?m)^exit\s+0\s*$', pr):
+                      pr = re.sub(r'(?m)^exit\s+0\s*$', uicache_del + '\nexit 0', pr, count=1)
+                  else:
+                      pr = pr + "\n" + uicache_del + "\nexit 0\n"
+              open(prerm_path, "w").write(pr)
+          else:
+              open(prerm_path, "w").write("#!/bin/sh\n" + uicache_del + "\nexit 0\n")
+          os.chmod(prerm_path, 0o755)
+
           assert plistlib.load(open("GeoShim.plist", "rb")) == {"Filter": {"Executables": ["locationd"]}}
           assert "gIpcDmachInHits" in open("Tweak.x").read()
-          assert "dmach_in=" in open("cli/main.m").read()
+          assert "SUBPROJECTS += app" in open("Makefile").read()
           print("patch ok")
           PY
 
@@ -1253,21 +2299,21 @@ jobs:
           tar -xf /tmp/sdk.tar.xz -C "$HOME/theos/sdks"
           ls "$HOME/theos/sdks"
 
-      - name: Build .deb (release build)
+      - name: Build .deb (release + GeoShimApp)
         run: |
           export THEOS="$HOME/theos"
           make package FINALPACKAGE=1 ARCHS=arm64e
 
-      - name: Verify ABI, package, diagnostics
+      - name: Verify ABI, package, app, entitlements
         run: |
           python3 - << 'PY'
           import glob, os, struct, sys
           cands = []
-          for pat in ("**/GeoShim.dylib", "**/geoshim"):
+          for pat in ("**/GeoShim.dylib", "**/geoshim", "**/GeoShimApp.app/GeoShimApp"):
               cands += glob.glob(os.path.join(".theos/obj", pat), recursive=True)
           files = [p for p in cands if os.path.isfile(p)]
-          if not files:
-              sys.exit("no built binaries found")
+          if len(files) < 3:
+              sys.exit(f"missing built binaries: {files}")
           bad = []
           for p in files:
               magic, cputype, subtype = struct.unpack("<III", open(p, "rb").read(12))
@@ -1276,16 +2322,20 @@ jobs:
                   bad.append(p)
           if bad:
               sys.exit("old arm64e ABI: " + ", ".join(bad))
-          print("OK: arm64e ptrauth ABI")
+          print("OK: all 3 binaries have arm64e ptrauth ABI")
           PY
           DEB=$(ls packages/*.deb | head -n 1)
           echo "deb: $DEB"
           dpkg-deb -f "$DEB" Package Version Architecture Depends
           [ "$(dpkg-deb -f "$DEB" Architecture)" = "iphoneos-arm64e" ] || { echo "bad package arch"; exit 1; }
-          dpkg-deb -c "$DEB" | grep -E 'GeoShim\.dylib$|/geoshim$'
+          dpkg-deb -c "$DEB" | grep -E 'GeoShim\.dylib$|/geoshim$|GeoShimApp\.app/GeoShimApp$'
           rm -rf /tmp/debx && dpkg-deb -x "$DEB" /tmp/debx
           strings /tmp/debx/Library/MobileSubstrate/DynamicLibraries/GeoShim.dylib | grep -q "regulad.geoshim.xpc4" || { echo "xpc release missing in dylib"; exit 1; }
           strings /tmp/debx/usr/local/bin/geoshim | grep -q "dmach_in=" || { echo "xpc release output missing in cli"; exit 1; }
+          [ -f /tmp/debx/Applications/GeoShimApp.app/GeoShimApp ] || { echo "GeoShimApp binary missing"; exit 1; }
+          [ -f /tmp/debx/Applications/GeoShimApp.app/AppIcon60x60@3x.png ] || { echo "AppIcon missing"; exit 1; }
+          ldid -e /tmp/debx/Applications/GeoShimApp.app/GeoShimApp | grep -q "no-sandbox" || { echo "entitlements missing on GeoShimApp"; exit 1; }
+          dpkg-deb -I "$DEB" postinst | grep -q "uicache" || { echo "postinst uicache missing"; exit 1; }
           python3 -c 'import plistlib; p=plistlib.load(open("/tmp/debx/Library/MobileSubstrate/DynamicLibraries/GeoShim.plist","rb")); assert p=={"Filter":{"Executables":["locationd"]}}, p; print("filter ok")'
 
       - name: Save .deb file
