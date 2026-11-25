@@ -66,18 +66,25 @@ jobs:
           #include <math.h>
           #include <dlfcn.h>
           #include <substrate.h>
-
-          typedef void *gs_xpc_t;
-          struct _xpc_type_s;
+          #if __has_include(<xpc/xpc.h>)
+          #include <xpc/xpc.h>
+          #else
+          typedef id xpc_object_t;
+          typedef xpc_object_t xpc_connection_t;
+          typedef const struct _xpc_type_s *xpc_type_t;
           extern const struct _xpc_type_s _xpc_type_dictionary;
           extern const struct _xpc_type_s _xpc_type_data;
           extern const struct _xpc_type_s _xpc_type_double;
-          extern const void *xpc_get_type(gs_xpc_t obj);
-          extern bool xpc_dictionary_apply(gs_xpc_t xdict, bool (^applier)(const char *key, gs_xpc_t value));
-          extern const void *xpc_data_get_bytes_ptr(gs_xpc_t xdata);
-          extern size_t xpc_data_get_length(gs_xpc_t xdata);
-          extern double xpc_double_get_value(gs_xpc_t xdouble);
-          extern void xpc_connection_send_message(gs_xpc_t conn, gs_xpc_t msg);
+          #define XPC_TYPE_DICTIONARY (&_xpc_type_dictionary)
+          #define XPC_TYPE_DATA (&_xpc_type_data)
+          #define XPC_TYPE_DOUBLE (&_xpc_type_double)
+          extern xpc_type_t xpc_get_type(xpc_object_t obj);
+          extern bool xpc_dictionary_apply(xpc_object_t xdict, bool (^applier)(const char *key, xpc_object_t value));
+          extern const void *xpc_data_get_bytes_ptr(xpc_object_t xdata);
+          extern size_t xpc_data_get_length(xpc_object_t xdata);
+          extern double xpc_double_get_value(xpc_object_t xdouble);
+          extern void xpc_connection_send_message(xpc_connection_t conn, xpc_object_t msg);
+          #endif
 
           static _Atomic uint32_t gDiagEnter = 0;
           static _Atomic uint32_t gDiagSpoof = 0;
@@ -191,18 +198,18 @@ jobs:
               }
           }
 
-          static void gs_scan_xpc_dict(gs_xpc_t dict, int depth, uint32_t fnBit) {
+          static void gs_scan_xpc_dict(xpc_object_t dict, int depth, uint32_t fnBit) {
               if (!dict || depth > 3) return;
-              if (xpc_get_type(dict) != (const void *)&_xpc_type_dictionary) return;
-              xpc_dictionary_apply(dict, ^bool(const char *key, gs_xpc_t val) {
+              if (xpc_get_type(dict) != XPC_TYPE_DICTIONARY) return;
+              xpc_dictionary_apply(dict, ^bool(const char *key, xpc_object_t val) {
                   (void)key;
                   if (!val) return true;
-                  const void *t = xpc_get_type(val);
-                  if (t == (const void *)&_xpc_type_data) {
+                  xpc_type_t t = xpc_get_type(val);
+                  if (t == XPC_TYPE_DATA) {
                       gs_scan_xpc_blob((const uint8_t *)xpc_data_get_bytes_ptr(val), xpc_data_get_length(val), fnBit);
-                  } else if (t == (const void *)&_xpc_type_dictionary) {
+                  } else if (t == XPC_TYPE_DICTIONARY) {
                       gs_scan_xpc_dict(val, depth + 1, fnBit);
-                  } else if (t == (const void *)&_xpc_type_double && atomic_load_explicit(&gHasRealCoord, memory_order_acquire)) {
+                  } else if (t == XPC_TYPE_DOUBLE && atomic_load_explicit(&gHasRealCoord, memory_order_acquire)) {
                       double d = xpc_double_get_value(val);
                       if (fabs(d - gLastRealLat) < 0.05 && fabs(gLastRealLat) > 0.05) {
                           atomic_store(&gXpcDblKey, 1);
@@ -212,10 +219,10 @@ jobs:
               });
           }
 
-          static void (*gOrigXpcSendMsg)(gs_xpc_t, gs_xpc_t) = NULL;
-          static void (*gOrigXpcSendNotif)(gs_xpc_t, gs_xpc_t) = NULL;
+          static void (*gOrigXpcSendMsg)(xpc_connection_t, xpc_object_t) = NULL;
+          static void (*gOrigXpcSendNotif)(xpc_connection_t, xpc_object_t) = NULL;
 
-          static void gs_xpc_send_msg(gs_xpc_t conn, gs_xpc_t msg) {
+          static void gs_xpc_send_msg(xpc_connection_t conn, xpc_object_t msg) {
               if (!gInXpcHook) {
                   gInXpcHook = 1;
                   uint32_t n = atomic_fetch_add(&gXpcMsgCalls, 1) + 1;
@@ -226,7 +233,7 @@ jobs:
               if (gOrigXpcSendMsg) gOrigXpcSendMsg(conn, msg);
           }
 
-          static void gs_xpc_send_notif(gs_xpc_t conn, gs_xpc_t msg) {
+          static void gs_xpc_send_notif(xpc_connection_t conn, xpc_object_t msg) {
               if (!gInXpcHook) {
                   gInXpcHook = 1;
                   uint32_t n = atomic_fetch_add(&gXpcNotifCalls, 1) + 1;
