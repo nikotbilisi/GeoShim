@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Patch package with full iOS 18 XPC rewriter v2
+      - name: Patch package with full iOS 18 IPC/XPC/Mach rewriter v3
         run: |
           python3 - << 'PY'
           import re, plistlib, shutil
@@ -56,9 +56,13 @@ jobs:
           old_anchor = "static IMP gEncodeWithCoderOrig = NULL;"
           xpc_rewriter = old_anchor + r'''
 
-          // --- GeoShim iOS 18 Full XPC Rewriter v2 (adjacent + non-adjacent + BE + XPC_DOUBLE) ---
+          // --- GeoShim iOS 18 Total IPC Rewriter v3 (XPC + Pipe + Session + CFMessagePort + dispatch_mach) ---
           #include <notify.h>
           #include <dispatch/dispatch.h>
+          #include <CoreFoundation/CoreFoundation.h>
+          #include <mach/mach.h>
+          #include <mach/message.h>
+          #include <unistd.h>
           #include <stdatomic.h>
           #include <stdbool.h>
           #include <stdint.h>
@@ -93,10 +97,12 @@ jobs:
           extern void xpc_dictionary_set_data(xpc_object_t xdict, const char *key, const void *bytes, size_t length);
           extern void xpc_dictionary_set_double(xpc_object_t xdict, const char *key, double value);
           extern void xpc_array_set_data(xpc_object_t xarray, size_t index, const void *bytes, size_t length);
+          extern void xpc_array_set_double(xpc_object_t xarray, size_t index, double value);
           extern void xpc_connection_send_message(xpc_connection_t conn, xpc_object_t msg);
           extern void xpc_connection_send_message_with_reply(xpc_connection_t conn, xpc_object_t msg, dispatch_queue_t q, xpc_handler_t h);
-          extern xpc_object_t xpc_connection_send_message_with_reply_sync(xpc_connection_t conn, xpc_object_t msg);
           #endif
+
+          #define GS_DEG2RAD (3.14159265358979323846 / 180.0)
 
           static _Atomic uint32_t gDiagEnter = 0;
           static _Atomic uint32_t gDiagSpoof = 0;
@@ -104,21 +110,41 @@ jobs:
 
           static double gLastRealLat = 0.0, gLastRealLon = 0.0;
           static _Atomic uint32_t gHasRealCoord = 0;
+          static double gCandRealLat = 0.0, gCandRealLon = 0.0;
+          static int gCandRealCount = 0;
 
+          static _Atomic uint32_t gCachedActive = 0;
           static double gCachedFakeLat = 0.0, gCachedFakeLon = 0.0;
           static CFAbsoluteTime gCachedFakeTs = 0.0;
+
+          static CFAbsoluteTime gBootTime = 0.0;
+          static uint32_t gDaemonPid = 0;
 
           static _Atomic uint32_t gXpcHookedMsg = 0;
           static _Atomic uint32_t gXpcHookedNotif = 0;
           static _Atomic uint32_t gXpcHookedReply = 0;
           static _Atomic uint32_t gXpcHookedSync = 0;
+          static _Atomic uint32_t gHookedPipe = 0;
+          static _Atomic uint32_t gHookedCfmp = 0;
+          static _Atomic uint32_t gHookedDmach = 0;
+          static _Atomic uint32_t gHookedSess = 0;
+
           static _Atomic uint32_t gXpcBlobsRewritten = 0;
           static _Atomic uint32_t gXpcPairsRewritten = 0;
           static _Atomic uint32_t gXpcNonAdjRewritten = 0;
           static _Atomic uint32_t gXpcDblRewritten = 0;
-          static _Atomic uint32_t gXpcFloatSeen = 0;
+          static _Atomic uint32_t gXpcRadRewritten = 0;
+          static _Atomic uint32_t gXpcFloatRewritten = 0;
           static _Atomic uint32_t gXpcShmemSeen = 0;
           static _Atomic uint32_t gXpcTotalCalls = 0;
+
+          static _Atomic uint32_t gIpcPostLeak = 0;
+          static _Atomic uint32_t gIpcPipeRewritten = 0;
+          static _Atomic uint32_t gIpcCfmpRewritten = 0;
+          static _Atomic uint32_t gIpcDmachInHits = 0;
+          static _Atomic uint32_t gIpcDmachOolHits = 0;
+          static _Atomic uint32_t gIpcSessRewritten = 0;
+          static _Atomic uint32_t gAnchorFlips = 0;
 
           static __thread int gInXpcHook = 0;
 
@@ -126,14 +152,20 @@ jobs:
           #define GS_REAL_NOTIFY "xyz.regulad.geoshim.real"
           #define GS_XPC_NOTIFY  "xyz.regulad.geoshim.xpc"
           #define GS_XPC2_NOTIFY "xyz.regulad.geoshim.xpc2"
+          #define GS_XPC3_NOTIFY "xyz.regulad.geoshim.xpc3"
+          #define GS_XPC4_NOTIFY "xyz.regulad.geoshim.xpc4"
+          #define GS_PROC_NOTIFY "xyz.regulad.geoshim.proc"
 
           static void gs_set_state(const char *name, int *tok, uint64_t val) {
+              int prev = gInXpcHook;
+              gInXpcHook = 1;
               if (*tok == -1) notify_register_check(name, tok);
               if (*tok != -1) notify_set_state(*tok, val);
+              gInXpcHook = prev;
           }
 
           static void gs_diag_publish(void) {
-              static int tok = -1, rtok = -1;
+              static int tok = -1, rtok = -1, ptok = -1;
               uint64_t v = (1ULL << 63)
                          | (uint64_t)(atomic_load(&gDiagEnter) & 0xFFFF)
                          | ((uint64_t)(atomic_load(&gDiagSpoof) & 0xFFFF) << 16)
@@ -145,24 +177,47 @@ jobs:
                   uint64_t rv = ((uint64_t)(uint32_t)ilat) | (((uint64_t)(uint32_t)ilon) << 32);
                   gs_set_state(GS_REAL_NOTIFY, &rtok, rv);
               }
+              uint32_t up = gBootTime > 0.0 ? (uint32_t)(CFAbsoluteTimeGetCurrent() - gBootTime) : 0;
+              uint64_t pv = ((uint64_t)gDaemonPid) | (((uint64_t)up) << 32);
+              gs_set_state(GS_PROC_NOTIFY, &ptok, pv);
           }
 
           static void gs_xpc_publish(void) {
-              static int tok = -1, tok2 = -1;
+              static int tok = -1, tok2 = -1, tok3 = -1, tok4 = -1, ptok = -1;
               uint64_t v = (1ULL << 63)
                          | ((uint64_t)(atomic_load(&gXpcHookedMsg) & 1) << 62)
                          | ((uint64_t)(atomic_load(&gXpcHookedNotif) & 1) << 61)
                          | ((uint64_t)(atomic_load(&gXpcHookedReply) & 1) << 60)
                          | ((uint64_t)(atomic_load(&gXpcHookedSync) & 1) << 59)
+                         | ((uint64_t)(atomic_load(&gHookedPipe) & 1) << 58)
+                         | ((uint64_t)(atomic_load(&gHookedCfmp) & 1) << 57)
+                         | ((uint64_t)(atomic_load(&gHookedDmach) & 1) << 56)
+                         | ((uint64_t)(atomic_load(&gHookedSess) & 1) << 55)
                          | ((uint64_t)(atomic_load(&gXpcBlobsRewritten) & 0xFFFFF) << 20)
                          | (uint64_t)(atomic_load(&gXpcPairsRewritten) & 0xFFFFF);
               gs_set_state(GS_XPC_NOTIFY, &tok, v);
 
               uint64_t v2 = (uint64_t)(atomic_load(&gXpcNonAdjRewritten) & 0xFFFF)
                           | ((uint64_t)(atomic_load(&gXpcDblRewritten) & 0xFFFF) << 16)
-                          | ((uint64_t)(atomic_load(&gXpcFloatSeen) & 0xFFFF) << 32)
-                          | ((uint64_t)(atomic_load(&gXpcShmemSeen) & 0xFFFF) << 48);
+                          | ((uint64_t)(atomic_load(&gXpcRadRewritten) & 0xFFFF) << 32)
+                          | ((uint64_t)(atomic_load(&gXpcFloatRewritten) & 0xFFFF) << 48);
               gs_set_state(GS_XPC2_NOTIFY, &tok2, v2);
+
+              uint64_t v3 = (uint64_t)(atomic_load(&gIpcPostLeak) & 0xFFFF)
+                          | ((uint64_t)(atomic_load(&gIpcPipeRewritten) & 0xFFFF) << 16)
+                          | ((uint64_t)(atomic_load(&gIpcCfmpRewritten) & 0xFFFF) << 32)
+                          | ((uint64_t)(atomic_load(&gIpcDmachInHits) & 0xFFFF) << 48);
+              gs_set_state(GS_XPC3_NOTIFY, &tok3, v3);
+
+              uint64_t v4 = (uint64_t)(atomic_load(&gIpcDmachOolHits) & 0xFFFF)
+                          | ((uint64_t)(atomic_load(&gAnchorFlips) & 0xFFFF) << 16)
+                          | ((uint64_t)(atomic_load(&gXpcShmemSeen) & 0xFFFF) << 32)
+                          | ((uint64_t)(atomic_load(&gIpcSessRewritten) & 0xFFFF) << 48);
+              gs_set_state(GS_XPC4_NOTIFY, &tok4, v4);
+
+              uint32_t up = gBootTime > 0.0 ? (uint32_t)(CFAbsoluteTimeGetCurrent() - gBootTime) : 0;
+              uint64_t pv = ((uint64_t)gDaemonPid) | (((uint64_t)up) << 32);
+              gs_set_state(GS_PROC_NOTIFY, &ptok, pv);
           }
 
           static void gs_diag_inc(_Atomic uint32_t *c) { atomic_fetch_add(c, 1); gs_diag_publish(); }
@@ -180,72 +235,147 @@ jobs:
               return __builtin_bswap64(u);
           }
 
-          typedef struct { char *key; uint8_t *buf; size_t len; } gs_dict_patch_t;
-          typedef struct { gs_dict_patch_t items[32]; int count; } gs_dict_patch_list_t;
-          typedef struct { char *key; double val; } gs_dbl_patch_t;
-          typedef struct { gs_dbl_patch_t items[16]; int count; bool hasLat; bool hasLon; } gs_dbl_patch_list_t;
-          typedef struct { size_t idx; uint8_t *buf; size_t len; } gs_arr_patch_t;
-          typedef struct { gs_arr_patch_t items[32]; int count; } gs_arr_patch_list_t;
+          static inline float gs_bswap_f(uint32_t raw) {
+              uint32_t sw = __builtin_bswap32(raw);
+              float f;
+              memcpy(&f, &sw, 4);
+              return f;
+          }
 
-          static uint8_t *gs_make_patched_blob(const uint8_t *src, size_t len,
-                                               double rlat, double rlon,
-                                               double flat, double flon,
-                                               uint32_t *outPairs, bool *outNonAdj) {
-              if (!src || len < 16) return NULL;
-              size_t lim = len > 65536 ? 65536 : len;
+          static inline uint32_t gs_f_to_be(float f) {
+              uint32_t u;
+              memcpy(&u, &f, 4);
+              return __builtin_bswap32(u);
+          }
 
-              bool hasLatLE = false, hasLonLE = false;
-              bool hasLatBE = false, hasLonBE = false;
-              bool hasFloat = false;
-              for (size_t off = 0; off + 8 <= lim; off++) {
-                  double d;
-                  memcpy(&d, src + off, 8);
-                  if (isfinite(d)) {
-                      if (fabs(d - rlat) < 0.25) hasLatLE = true;
-                      else if (fabs(d - rlon) < 0.25) hasLonLE = true;
-                  }
-                  uint64_t u;
-                  memcpy(&u, src + off, 8);
-                  double b = gs_bswap_d(u);
-                  if (isfinite(b)) {
-                      if (fabs(b - rlat) < 0.25) hasLatBE = true;
-                      else if (fabs(b - rlon) < 0.25) hasLonBE = true;
-                  }
-                  if (!hasFloat) {
-                      float f0, f1;
-                      memcpy(&f0, src + off, 4);
-                      memcpy(&f1, src + off + 4, 4);
-                      if (isfinite(f0) && isfinite(f1) &&
-                          fabs((double)f0 - rlat) < 0.05 && fabs((double)f1 - rlon) < 0.05) {
-                          hasFloat = true;
+          static inline bool gs_is_already_fake(double lat, double lon, double flat, double flon) {
+              return fabs(lat - flat) < 0.002 && fabs(lon - flon) < 0.002;
+          }
+
+          static void gs_note_live_real_coord(double lat, double lon, double flat, double flon, bool hasFake) {
+              if (!isfinite(lat) || !isfinite(lon) || fabs(lat) > 90.0 || fabs(lon) > 180.0) return;
+              if (fabs(lat) < 0.1 && fabs(lon) < 0.1) return;
+              if (atomic_load_explicit(&gHasRealCoord, memory_order_acquire)) {
+                  // Ignore coordinates that are actually our own spoofed target when target is far from real
+                  if (hasFake && (fabs(flat - gLastRealLat) > 0.08 || fabs(flon - gLastRealLon) > 0.08)) {
+                      if (fabs(lat - flat) < 0.05 && fabs(lon - flon) < 0.05) {
+                          atomic_fetch_add(&gAnchorFlips, 1);
+                          return;
                       }
                   }
+                  // Reject single stray geofence/region jumps > 2 deg unless 3 consecutive fresh fixes agree
+                  if (fabs(lat - gLastRealLat) > 2.0 || fabs(lon - gLastRealLon) > 2.0) {
+                      atomic_fetch_add(&gAnchorFlips, 1);
+                      if (fabs(lat - gCandRealLat) < 0.5 && fabs(lon - gCandRealLon) < 0.5) {
+                          gCandRealCount++;
+                          if (gCandRealCount < 3) return;
+                      } else {
+                          gCandRealLat = lat; gCandRealLon = lon; gCandRealCount = 1;
+                          return;
+                      }
+                  }
+                  gCandRealCount = 0;
               }
-              if (hasFloat) atomic_fetch_add(&gXpcFloatSeen, 1);
+              gLastRealLat = lat;
+              gLastRealLon = lon;
+              atomic_store_explicit(&gHasRealCoord, 1, memory_order_release);
+          }
 
-              bool doLE = (hasLatLE && hasLonLE);
-              bool doBE = (hasLatBE && hasLonBE);
-              if (!doLE && !doBE) return NULL;
-
-              uint8_t *buf = (uint8_t *)malloc(len);
-              if (!buf) return NULL;
-              memcpy(buf, src, len);
-
-              uint32_t adjPairs = 0, nonAdjVals = 0;
-              uint64_t flatBE = gs_d_to_be(flat), flonBE = gs_d_to_be(flon);
+          // Fast read-only leak detector (excludes already-fake coordinates)
+          static bool gs_buf_has_unpatched_real(const uint8_t *src, size_t len,
+                                                double rlat, double rlon,
+                                                double flat, double flon) {
+              if (!src || len < 8) return false;
+              size_t lim = len > 262144 ? 262144 : len;
+              double rlatRad = rlat * GS_DEG2RAD, rlonRad = rlon * GS_DEG2RAD;
+              double flatRad = flat * GS_DEG2RAD, flonRad = flon * GS_DEG2RAD;
+              bool checkRad = (fabs(rlatRad) > 0.01 || fabs(rlonRad) > 0.01);
+              bool hasLatLE = false, hasLonLE = false;
+              bool hasLatBE = false, hasLonBE = false;
 
               for (size_t off = 0; off + 8 <= lim; off++) {
-                  if (doLE) {
-                      double d0;
+                  double d0;
+                  memcpy(&d0, src + off, 8);
+                  if (isfinite(d0)) {
+                      if (off + 16 <= lim) {
+                          double d1;
+                          memcpy(&d1, src + off + 8, 8);
+                          if (isfinite(d1)) {
+                              if (fabs(d0 - rlat) < 1.5 && fabs(d1 - rlon) < 1.5 &&
+                                  !gs_is_already_fake(d0, d1, flat, flon)) {
+                                  return true;
+                              }
+                              if (checkRad && fabs(d0 - rlatRad) < 0.025 && fabs(d1 - rlonRad) < 0.025 &&
+                                  !(fabs(d0 - flatRad) < 0.0001 && fabs(d1 - flonRad) < 0.0001)) {
+                                  return true;
+                              }
+                          }
+                      }
+                      if (fabs(d0 - rlat) < 0.5 && !(fabs(d0 - flat) < 0.002 && fabs(rlat - flat) > 0.002)) hasLatLE = true;
+                      if (fabs(d0 - rlon) < 0.5 && !(fabs(d0 - flon) < 0.002 && fabs(rlon - flon) > 0.002)) hasLonLE = true;
+                  }
+                  uint64_t u0;
+                  memcpy(&u0, src + off, 8);
+                  double b0 = gs_bswap_d(u0);
+                  if (isfinite(b0)) {
+                      if (off + 16 <= lim) {
+                          uint64_t u1;
+                          memcpy(&u1, src + off + 8, 8);
+                          double b1 = gs_bswap_d(u1);
+                          if (isfinite(b1)) {
+                              if (fabs(b0 - rlat) < 1.5 && fabs(b1 - rlon) < 1.5 &&
+                                  !gs_is_already_fake(b0, b1, flat, flon)) {
+                                  return true;
+                              }
+                              if (checkRad && fabs(b0 - rlatRad) < 0.025 && fabs(b1 - rlonRad) < 0.025 &&
+                                  !(fabs(b0 - flatRad) < 0.0001 && fabs(b1 - flonRad) < 0.0001)) {
+                                  return true;
+                              }
+                          }
+                      }
+                      if (fabs(b0 - rlat) < 0.5 && !(fabs(b0 - flat) < 0.002 && fabs(rlat - flat) > 0.002)) hasLatBE = true;
+                      if (fabs(b0 - rlon) < 0.5 && !(fabs(b0 - flon) < 0.002 && fabs(rlon - flon) > 0.002)) hasLonBE = true;
+                  }
+                  float f0, f1;
+                  memcpy(&f0, src + off, 4);
+                  memcpy(&f1, src + off + 4, 4);
+                  if (isfinite(f0) && isfinite(f1) &&
+                      fabs((double)f0 - rlat) < 0.25 && fabs((double)f1 - rlon) < 0.25 &&
+                      !gs_is_already_fake((double)f0, (double)f1, flat, flon)) {
+                      return true;
+                  }
+              }
+              if (fabs(rlat) > 1.0 && fabs(rlon) > 1.0) {
+                  if ((hasLatLE && hasLonLE) || (hasLatBE && hasLonBE)) return true;
+              }
+              return false;
+          }
+
+          static uint32_t gs_patch_buf_inplace(uint8_t *buf, size_t len,
+                                               double rlat, double rlon,
+                                               double flat, double flon,
+                                               bool *outNonAdj, bool *outRad, bool *outF32) {
+              if (!buf || len < 8) return 0;
+              size_t lim = len > 262144 ? 262144 : len;
+              double rlatRad = rlat * GS_DEG2RAD, rlonRad = rlon * GS_DEG2RAD;
+              double flatRad = flat * GS_DEG2RAD, flonRad = flon * GS_DEG2RAD;
+              uint64_t flatBE = gs_d_to_be(flat), flonBE = gs_d_to_be(flon);
+              uint64_t flatRadBE = gs_d_to_be(flatRad), flonRadBE = gs_d_to_be(flonRad);
+              float flatF = (float)flat, flonF = (float)flon;
+              uint32_t flatFBE = gs_f_to_be(flatF), flonFBE = gs_f_to_be(flonF);
+              bool checkRad = (fabs(rlatRad) > 0.01 || fabs(rlonRad) > 0.01);
+
+              uint32_t adjPairs = 0, radPairs = 0, f32Pairs = 0, nonAdjVals = 0;
+
+              // Pass 1: Adjacent pairs (LE/BE double degrees, LE/BE double radians, LE/BE float32 degrees)
+              for (size_t off = 0; off + 8 <= lim; off++) {
+                  if (off + 16 <= lim) {
+                      double d0, d1;
                       memcpy(&d0, buf + off, 8);
-                      if (isfinite(d0) && fabs(d0 - rlat) < 0.25) {
-                          if (off + 16 <= lim) {
-                              double d1;
-                              memcpy(&d1, buf + off + 8, 8);
-                              if (isfinite(d1) && fabs(d1 - rlon) < 0.25) {
-                                  if (fabs(d0 - flat) > 0.001 || fabs(d1 - flon) > 0.001) {
-                                      gLastRealLat = d0; gLastRealLon = d1;
-                                  }
+                      memcpy(&d1, buf + off + 8, 8);
+                      if (isfinite(d0) && isfinite(d1)) {
+                          if (fabs(d0 - rlat) < 1.5 && fabs(d1 - rlon) < 1.5) {
+                              if (!gs_is_already_fake(d0, d1, flat, flon)) {
                                   memcpy(buf + off, &flat, 8);
                                   memcpy(buf + off + 8, &flon, 8);
                                   adjPairs++;
@@ -253,50 +383,201 @@ jobs:
                                   continue;
                               }
                           }
-                          if (fabs(d0 - rlat) < 0.15) {
-                              memcpy(buf + off, &flat, 8);
-                              nonAdjVals++;
-                              off += 7;
-                              continue;
+                          if (checkRad && fabs(d0 - rlatRad) < 0.025 && fabs(d1 - rlonRad) < 0.025) {
+                              if (!(fabs(d0 - flatRad) < 0.0001 && fabs(d1 - flonRad) < 0.0001)) {
+                                  memcpy(buf + off, &flatRad, 8);
+                                  memcpy(buf + off + 8, &flonRad, 8);
+                                  radPairs++;
+                                  off += 15;
+                                  continue;
+                              }
                           }
                       }
-                      if (isfinite(d0) && fabs(d0 - rlon) < 0.15) {
-                          memcpy(buf + off, &flon, 8);
-                          nonAdjVals++;
-                          off += 7;
-                          continue;
+                      uint64_t u0, u1;
+                      memcpy(&u0, buf + off, 8);
+                      memcpy(&u1, buf + off + 8, 8);
+                      double b0 = gs_bswap_d(u0), b1 = gs_bswap_d(u1);
+                      if (isfinite(b0) && isfinite(b1)) {
+                          if (fabs(b0 - rlat) < 1.5 && fabs(b1 - rlon) < 1.5) {
+                              if (!gs_is_already_fake(b0, b1, flat, flon)) {
+                                  memcpy(buf + off, &flatBE, 8);
+                                  memcpy(buf + off + 8, &flonBE, 8);
+                                  adjPairs++;
+                                  off += 15;
+                                  continue;
+                              }
+                          }
+                          if (checkRad && fabs(b0 - rlatRad) < 0.025 && fabs(b1 - rlonRad) < 0.025) {
+                              if (!(fabs(b0 - flatRad) < 0.0001 && fabs(b1 - flonRad) < 0.0001)) {
+                                  memcpy(buf + off, &flatRadBE, 8);
+                                  memcpy(buf + off + 8, &flonRadBE, 8);
+                                  radPairs++;
+                                  off += 15;
+                                  continue;
+                              }
+                          }
                       }
                   }
-                  if (doBE) {
+                  float f0, f1;
+                  memcpy(&f0, buf + off, 4);
+                  memcpy(&f1, buf + off + 4, 4);
+                  if (isfinite(f0) && isfinite(f1) &&
+                      fabs((double)f0 - rlat) < 0.25 && fabs((double)f1 - rlon) < 0.25 &&
+                      !gs_is_already_fake((double)f0, (double)f1, flat, flon)) {
+                      memcpy(buf + off, &flatF, 4);
+                      memcpy(buf + off + 4, &flonF, 4);
+                      f32Pairs++;
+                      off += 7;
+                      continue;
+                  }
+                  uint32_t fu0, fu1;
+                  memcpy(&fu0, buf + off, 4);
+                  memcpy(&fu1, buf + off + 4, 4);
+                  float bf0 = gs_bswap_f(fu0), bf1 = gs_bswap_f(fu1);
+                  if (isfinite(bf0) && isfinite(bf1) &&
+                      fabs((double)bf0 - rlat) < 0.25 && fabs((double)bf1 - rlon) < 0.25 &&
+                      !gs_is_already_fake((double)bf0, (double)bf1, flat, flon)) {
+                      memcpy(buf + off, &flatFBE, 4);
+                      memcpy(buf + off + 4, &flonFBE, 4);
+                      f32Pairs++;
+                      off += 7;
+                      continue;
+                  }
+              }
+
+              // Pass 2: Non-adjacent LE/BE doubles ONLY if BOTH unpatched lat AND unpatched lon still remain
+              if (fabs(rlat) > 1.0 && fabs(rlon) > 1.0) {
+                  bool remLatLE = false, remLonLE = false, remLatBE = false, remLonBE = false;
+                  for (size_t off = 0; off + 8 <= lim; off++) {
+                      double d;
+                      memcpy(&d, buf + off, 8);
+                      if (isfinite(d)) {
+                          if (fabs(d - rlat) < 0.5 && !(fabs(d - flat) < 0.002 && fabs(rlat - flat) > 0.002)) remLatLE = true;
+                          if (fabs(d - rlon) < 0.5 && !(fabs(d - flon) < 0.002 && fabs(rlon - flon) > 0.002)) remLonLE = true;
+                      }
                       uint64_t u;
                       memcpy(&u, buf + off, 8);
                       double b = gs_bswap_d(u);
-                      if (isfinite(b) && fabs(b - rlat) < 0.15) {
-                          memcpy(buf + off, &flatBE, 8);
-                          nonAdjVals++;
-                          off += 7;
-                          continue;
+                      if (isfinite(b)) {
+                          if (fabs(b - rlat) < 0.5 && !(fabs(b - flat) < 0.002 && fabs(rlat - flat) > 0.002)) remLatBE = true;
+                          if (fabs(b - rlon) < 0.5 && !(fabs(b - flon) < 0.002 && fabs(rlon - flon) > 0.002)) remLonBE = true;
                       }
-                      if (isfinite(b) && fabs(b - rlon) < 0.15) {
-                          memcpy(buf + off, &flonBE, 8);
-                          nonAdjVals++;
-                          off += 7;
-                          continue;
+                  }
+                  if ((remLatLE && remLonLE) || (remLatBE && remLonBE)) {
+                      for (size_t off = 0; off + 8 <= lim; off++) {
+                          if (remLatLE && remLonLE) {
+                              double d;
+                              memcpy(&d, buf + off, 8);
+                              if (isfinite(d)) {
+                                  if (fabs(d - rlat) < 0.5 && !(fabs(d - flat) < 0.002 && fabs(rlat - flat) > 0.002)) {
+                                      memcpy(buf + off, &flat, 8);
+                                      nonAdjVals++;
+                                      off += 7;
+                                      continue;
+                                  }
+                                  if (fabs(d - rlon) < 0.5 && !(fabs(d - flon) < 0.002 && fabs(rlon - flon) > 0.002)) {
+                                      memcpy(buf + off, &flon, 8);
+                                      nonAdjVals++;
+                                      off += 7;
+                                      continue;
+                                  }
+                              }
+                          }
+                          if (remLatBE && remLonBE) {
+                              uint64_t u;
+                              memcpy(&u, buf + off, 8);
+                              double b = gs_bswap_d(u);
+                              if (isfinite(b)) {
+                                  if (fabs(b - rlat) < 0.5 && !(fabs(b - flat) < 0.002 && fabs(rlat - flat) > 0.002)) {
+                                      memcpy(buf + off, &flatBE, 8);
+                                      nonAdjVals++;
+                                      off += 7;
+                                      continue;
+                                  }
+                                  if (fabs(b - rlon) < 0.5 && !(fabs(b - flon) < 0.002 && fabs(rlon - flon) > 0.002)) {
+                                      memcpy(buf + off, &flonBE, 8);
+                                      nonAdjVals++;
+                                      off += 7;
+                                      continue;
+                                  }
+                              }
+                          }
                       }
                   }
               }
 
-              uint32_t total = adjPairs + (nonAdjVals + 1) / 2;
+              if (outNonAdj) *outNonAdj = (nonAdjVals > 0);
+              if (outRad) *outRad = (radPairs > 0);
+              if (outF32) *outF32 = (f32Pairs > 0);
+              return adjPairs + radPairs + f32Pairs + (nonAdjVals + 1) / 2;
+          }
+
+          static uint8_t *gs_make_patched_blob(const uint8_t *src, size_t len,
+                                               double rlat, double rlon,
+                                               double flat, double flon,
+                                               uint32_t *outPairs, bool *outNonAdj,
+                                               bool *outRad, bool *outF32) {
+              if (!src || len < 8) return NULL;
+              if (!gs_buf_has_unpatched_real(src, len, rlat, rlon, flat, flon)) return NULL;
+              uint8_t *buf = (uint8_t *)malloc(len);
+              if (!buf) return NULL;
+              memcpy(buf, src, len);
+              uint32_t total = gs_patch_buf_inplace(buf, len, rlat, rlon, flat, flon, outNonAdj, outRad, outF32);
               if (total == 0) { free(buf); return NULL; }
               if (outPairs) *outPairs = total;
-              if (outNonAdj) *outNonAdj = (nonAdjVals > 0);
               return buf;
+          }
+
+          typedef struct { char *key; uint8_t *buf; size_t len; } gs_dict_patch_t;
+          typedef struct { gs_dict_patch_t items[64]; int count; } gs_dict_patch_list_t;
+          typedef struct { char *key; double val; } gs_dbl_patch_t;
+          typedef struct { gs_dbl_patch_t items[32]; int count; bool hasLat; bool hasLon; } gs_dbl_patch_list_t;
+          typedef struct { size_t idx; uint8_t *buf; size_t len; } gs_arr_patch_t;
+          typedef struct { gs_arr_patch_t items[64]; int count; } gs_arr_patch_list_t;
+          typedef struct { size_t idx; double val; } gs_adbl_patch_t;
+          typedef struct { gs_adbl_patch_t items[32]; int count; bool hasLat; bool hasLon; } gs_adbl_patch_list_t;
+
+          static bool gs_xpc_obj_has_leak(xpc_object_t obj, int depth,
+                                          double rlat, double rlon, double flat, double flon) {
+              if (!obj || depth > 16) return false;
+              xpc_type_t t = xpc_get_type(obj);
+              __block bool found = false;
+              if (t == XPC_TYPE_DICTIONARY) {
+                  xpc_dictionary_apply(obj, ^bool(const char *key, xpc_object_t val) {
+                      (void)key;
+                      if (!val || found) return false;
+                      xpc_type_t vt = xpc_get_type(val);
+                      if (vt == XPC_TYPE_DATA) {
+                          const uint8_t *p = (const uint8_t *)xpc_data_get_bytes_ptr(val);
+                          size_t len = xpc_data_get_length(val);
+                          if (gs_buf_has_unpatched_real(p, len, rlat, rlon, flat, flon)) { found = true; return false; }
+                      } else if (vt == XPC_TYPE_DICTIONARY || vt == XPC_TYPE_ARRAY) {
+                          if (gs_xpc_obj_has_leak(val, depth + 1, rlat, rlon, flat, flon)) { found = true; return false; }
+                      }
+                      return true;
+                  });
+              } else if (t == XPC_TYPE_ARRAY) {
+                  xpc_array_apply(obj, ^bool(size_t idx, xpc_object_t val) {
+                      (void)idx;
+                      if (!val || found) return false;
+                      xpc_type_t vt = xpc_get_type(val);
+                      if (vt == XPC_TYPE_DATA) {
+                          const uint8_t *p = (const uint8_t *)xpc_data_get_bytes_ptr(val);
+                          size_t len = xpc_data_get_length(val);
+                          if (gs_buf_has_unpatched_real(p, len, rlat, rlon, flat, flon)) { found = true; return false; }
+                      } else if (vt == XPC_TYPE_DICTIONARY || vt == XPC_TYPE_ARRAY) {
+                          if (gs_xpc_obj_has_leak(val, depth + 1, rlat, rlon, flat, flon)) { found = true; return false; }
+                      }
+                      return true;
+                  });
+              }
+              return found;
           }
 
           static bool gs_rewrite_xpc_obj(xpc_object_t obj, int depth,
                                          double rlat, double rlon,
                                          double flat, double flon) {
-              if (!obj || depth > 8) return false;
+              if (!obj || depth > 16) return false;
               xpc_type_t t = xpc_get_type(obj);
               bool changed = false;
               if (t == XPC_TYPE_DICTIONARY) {
@@ -312,12 +593,12 @@ jobs:
                   xpc_dictionary_apply(obj, ^bool(const char *key, xpc_object_t val) {
                       if (!val) return true;
                       xpc_type_t vt = xpc_get_type(val);
-                      if (vt == XPC_TYPE_DATA && key && dp->count < 32) {
+                      if (vt == XPC_TYPE_DATA && key && dp->count < 64) {
                           const uint8_t *p = (const uint8_t *)xpc_data_get_bytes_ptr(val);
                           size_t len = xpc_data_get_length(val);
                           uint32_t pairs = 0;
-                          bool nonAdj = false;
-                          uint8_t *patched = gs_make_patched_blob(p, len, rlat, rlon, flat, flon, &pairs, &nonAdj);
+                          bool nonAdj = false, rad = false, f32 = false;
+                          uint8_t *patched = gs_make_patched_blob(p, len, rlat, rlon, flat, flon, &pairs, &nonAdj, &rad, &f32);
                           if (patched) {
                               char *kcopy = strdup(key);
                               if (kcopy) {
@@ -328,16 +609,18 @@ jobs:
                                   atomic_fetch_add(&gXpcBlobsRewritten, 1);
                                   atomic_fetch_add(&gXpcPairsRewritten, pairs);
                                   if (nonAdj) atomic_fetch_add(&gXpcNonAdjRewritten, 1);
+                                  if (rad) atomic_fetch_add(&gXpcRadRewritten, 1);
+                                  if (f32) atomic_fetch_add(&gXpcFloatRewritten, 1);
                               } else {
                                   free(patched);
                               }
                           }
-                      } else if (vt == XPC_TYPE_DOUBLE && key && dblp->count < 16) {
+                      } else if (vt == XPC_TYPE_DOUBLE && key && dblp->count < 32) {
                           double dv = xpc_double_get_value(val);
-                          if (isfinite(dv) && fabs(dv - rlat) < 0.15) {
+                          if (isfinite(dv) && fabs(dv - rlat) < 0.5 && !(fabs(dv - flat) < 0.002 && fabs(rlat - flat) > 0.002)) {
                               char *kcopy = strdup(key);
                               if (kcopy) { dblp->items[dblp->count].key = kcopy; dblp->items[dblp->count].val = flat; dblp->count++; dblp->hasLat = true; }
-                          } else if (isfinite(dv) && fabs(dv - rlon) < 0.15) {
+                          } else if (isfinite(dv) && fabs(dv - rlon) < 0.5 && !(fabs(dv - flon) < 0.002 && fabs(rlon - flon) > 0.002)) {
                               char *kcopy = strdup(key);
                               if (kcopy) { dblp->items[dblp->count].key = kcopy; dblp->items[dblp->count].val = flon; dblp->count++; dblp->hasLon = true; }
                           }
@@ -369,16 +652,21 @@ jobs:
                   gs_arr_patch_list_t alist;
                   memset(&alist, 0, sizeof(alist));
                   gs_arr_patch_list_t *ap = &alist;
+
+                  gs_adbl_patch_list_t adlist;
+                  memset(&adlist, 0, sizeof(adlist));
+                  gs_adbl_patch_list_t *adp = &adlist;
+
                   __block bool childChanged = false;
                   xpc_array_apply(obj, ^bool(size_t idx, xpc_object_t val) {
                       if (!val) return true;
                       xpc_type_t vt = xpc_get_type(val);
-                      if (vt == XPC_TYPE_DATA && ap->count < 32) {
+                      if (vt == XPC_TYPE_DATA && ap->count < 64) {
                           const uint8_t *p = (const uint8_t *)xpc_data_get_bytes_ptr(val);
                           size_t len = xpc_data_get_length(val);
                           uint32_t pairs = 0;
-                          bool nonAdj = false;
-                          uint8_t *patched = gs_make_patched_blob(p, len, rlat, rlon, flat, flon, &pairs, &nonAdj);
+                          bool nonAdj = false, rad = false, f32 = false;
+                          uint8_t *patched = gs_make_patched_blob(p, len, rlat, rlon, flat, flon, &pairs, &nonAdj, &rad, &f32);
                           if (patched) {
                               ap->items[ap->count].idx = idx;
                               ap->items[ap->count].buf = patched;
@@ -387,6 +675,15 @@ jobs:
                               atomic_fetch_add(&gXpcBlobsRewritten, 1);
                               atomic_fetch_add(&gXpcPairsRewritten, pairs);
                               if (nonAdj) atomic_fetch_add(&gXpcNonAdjRewritten, 1);
+                              if (rad) atomic_fetch_add(&gXpcRadRewritten, 1);
+                              if (f32) atomic_fetch_add(&gXpcFloatRewritten, 1);
+                          }
+                      } else if (vt == XPC_TYPE_DOUBLE && adp->count < 32) {
+                          double dv = xpc_double_get_value(val);
+                          if (isfinite(dv) && fabs(dv - rlat) < 0.5 && !(fabs(dv - flat) < 0.002 && fabs(rlat - flat) > 0.002)) {
+                              adp->items[adp->count].idx = idx; adp->items[adp->count].val = flat; adp->count++; adp->hasLat = true;
+                          } else if (isfinite(dv) && fabs(dv - rlon) < 0.5 && !(fabs(dv - flon) < 0.002 && fabs(rlon - flon) > 0.002)) {
+                              adp->items[adp->count].idx = idx; adp->items[adp->count].val = flon; adp->count++; adp->hasLon = true;
                           }
                       } else if (vt == XPC_TYPE_SHMEM) {
                           atomic_fetch_add(&gXpcShmemSeen, 1);
@@ -402,33 +699,122 @@ jobs:
                       free(alist.items[i].buf);
                       changed = true;
                   }
+                  for (int i = 0; i < adlist.count; i++) {
+                      if (adlist.hasLat && adlist.hasLon) {
+                          xpc_array_set_double(obj, adlist.items[i].idx, adlist.items[i].val);
+                          atomic_fetch_add(&gXpcDblRewritten, 1);
+                          changed = true;
+                      }
+                  }
                   if (childChanged) changed = true;
               }
               return changed;
           }
 
-          static void gs_handle_outbound_xpc(xpc_object_t msg) {
-              if (!msg || !atomic_load_explicit(&gHasRealCoord, memory_order_acquire)) return;
-              double rlat = gLastRealLat, rlon = gLastRealLon;
-              if (fabs(rlat) < 0.05 && fabs(rlon) < 0.05) return;
+          static bool gs_refresh_fake_coord(double rlat, double rlon, double *outFlat, double *outFlon) {
               @autoreleasepool {
                   @try {
                       GSLocationFactory *factory = [GSLocationFactory shared];
-                      if (!factory.active) return;
+                      bool active = factory && factory.active;
+                      atomic_store_explicit(&gCachedActive, active ? 1 : 0, memory_order_release);
+                      if (!active) return false;
                       CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-                      if (now - gCachedFakeTs >= 1.0 || gCachedFakeTs == 0.0) {
+                      if (now - gCachedFakeTs >= 0.5 || gCachedFakeTs == 0.0) {
                           CLLocation *dummy = [[CLLocation alloc] initWithLatitude:rlat longitude:rlon];
                           CLLocation *fake = [factory spoofedLocationFromReal:dummy];
-                          if (!fake || !CLLocationCoordinate2DIsValid(fake.coordinate)) return;
+                          if (!fake || !CLLocationCoordinate2DIsValid(fake.coordinate)) return false;
                           gCachedFakeLat = fake.coordinate.latitude;
                           gCachedFakeLon = fake.coordinate.longitude;
                           gCachedFakeTs = now;
                       }
-                      bool did = gs_rewrite_xpc_obj(msg, 0, rlat, rlon, gCachedFakeLat, gCachedFakeLon);
-                      uint32_t n = atomic_fetch_add(&gXpcTotalCalls, 1) + 1;
-                      if (did || (n & 63) == 1) gs_xpc_publish();
+                      *outFlat = gCachedFakeLat;
+                      *outFlon = gCachedFakeLon;
+                      return true;
                   } @catch (NSException *e) {
                       (void)e;
+                      return false;
+                  }
+              }
+          }
+
+          static bool gs_handle_outbound_xpc(xpc_object_t msg) {
+              if (!msg || !atomic_load_explicit(&gHasRealCoord, memory_order_acquire)) return false;
+              double rlat = gLastRealLat, rlon = gLastRealLon;
+              if (fabs(rlat) < 0.05 && fabs(rlon) < 0.05) return false;
+              double flat = 0.0, flon = 0.0;
+              if (!gs_refresh_fake_coord(rlat, rlon, &flat, &flon)) return false;
+              bool did = gs_rewrite_xpc_obj(msg, 0, rlat, rlon, flat, flon);
+              if (did && gs_xpc_obj_has_leak(msg, 0, rlat, rlon, flat, flon)) {
+                  atomic_fetch_add(&gIpcPostLeak, 1);
+              }
+              uint32_t n = atomic_fetch_add(&gXpcTotalCalls, 1) + 1;
+              if (did || (n & 63) == 1) gs_xpc_publish();
+              return did;
+          }
+
+          // Pure lock-free C catch-all below XPC/NSXPC/dispatch_mach (zero ObjC, zero malloc, zero notify calls)
+          typedef mach_msg_header_t *(*gs_dmm_get_msg_fn)(void *dmsg, size_t *size_ptr);
+          static gs_dmm_get_msg_fn gDmmGetMsg = NULL;
+
+          static void gs_handle_outbound_dmach(void *dmsg) {
+              if (!dmsg || !gDmmGetMsg) return;
+              if (!atomic_load_explicit(&gCachedActive, memory_order_acquire)) return;
+              if (!atomic_load_explicit(&gHasRealCoord, memory_order_acquire)) return;
+              double rlat = gLastRealLat, rlon = gLastRealLon;
+              double flat = gCachedFakeLat, flon = gCachedFakeLon;
+              if ((fabs(rlat) < 0.05 && fabs(rlon) < 0.05) || (fabs(flat) < 0.0001 && fabs(flon) < 0.0001)) return;
+
+              size_t sz = 0;
+              mach_msg_header_t *hdr = gDmmGetMsg(dmsg, &sz);
+              if (!hdr || sz < sizeof(mach_msg_header_t) + 16) return;
+              if (hdr->msgh_size >= sizeof(mach_msg_header_t) && hdr->msgh_size < sz) {
+                  sz = hdr->msgh_size;
+              }
+              uint8_t *base = (uint8_t *)hdr;
+              size_t off = sizeof(mach_msg_header_t);
+
+              if (hdr->msgh_bits & MACH_MSGH_BITS_COMPLEX) {
+                  if (off + sizeof(mach_msg_body_t) > sz) return;
+                  const mach_msg_body_t *body = (const mach_msg_body_t *)(base + off);
+                  uint32_t dcnt = body->msgh_descriptor_count;
+                  if (dcnt > 256) dcnt = 256;
+                  off += sizeof(mach_msg_body_t);
+                  for (uint32_t i = 0; i < dcnt; i++) {
+                      if (off + sizeof(mach_msg_type_descriptor_t) > sz) { off = sz; break; }
+                      uint8_t dtype = ((const mach_msg_type_descriptor_t *)(base + off))->type;
+                      if (dtype == MACH_MSG_PORT_DESCRIPTOR) {
+                          off += sizeof(mach_msg_port_descriptor_t);
+                      } else if (dtype == MACH_MSG_OOL_DESCRIPTOR || dtype == MACH_MSG_OOL_VOLATILE_DESCRIPTOR) {
+                          if (off + sizeof(mach_msg_ool_descriptor_t) > sz) { off = sz; break; }
+                          const mach_msg_ool_descriptor_t *ool = (const mach_msg_ool_descriptor_t *)(base + off);
+                          if ((uintptr_t)ool->address > 0x10000 && ool->size >= 16 && ool->size <= 262144) {
+                              if (gs_buf_has_unpatched_real((const uint8_t *)ool->address, ool->size, rlat, rlon, flat, flon)) {
+                                  atomic_fetch_add(&gIpcDmachOolHits, 1);
+                              }
+                          }
+                          off += sizeof(mach_msg_ool_descriptor_t);
+                      } else if (dtype == MACH_MSG_OOL_PORTS_DESCRIPTOR) {
+                          off += sizeof(mach_msg_ool_ports_descriptor_t);
+                      }
+          #ifdef MACH_MSG_GUARDED_PORT_DESCRIPTOR
+                      else if (dtype == MACH_MSG_GUARDED_PORT_DESCRIPTOR) {
+                          off += sizeof(mach_msg_guarded_port_descriptor_t);
+                      }
+          #endif
+                      else {
+                          off = sz;
+                          break;
+                      }
+                  }
+              }
+
+              if (off < sz && (sz - off) >= 16) {
+                  if (gs_buf_has_unpatched_real(base + off, sz - off, rlat, rlon, flat, flon)) {
+                      bool na = false, rad = false, f32 = false;
+                      uint32_t patched = gs_patch_buf_inplace(base + off, sz - off, rlat, rlon, flat, flon, &na, &rad, &f32);
+                      if (patched > 0) {
+                          atomic_fetch_add(&gIpcDmachInHits, 1);
+                      }
                   }
               }
           }
@@ -436,58 +822,255 @@ jobs:
           static void (*gOrigXpcSendMsg)(xpc_connection_t, xpc_object_t) = NULL;
           static void (*gOrigXpcSendNotif)(xpc_connection_t, xpc_object_t) = NULL;
           static void (*gOrigXpcSendReply)(xpc_connection_t, xpc_object_t, dispatch_queue_t, xpc_handler_t) = NULL;
-          static xpc_object_t (*gOrigXpcSendSync)(xpc_connection_t, xpc_object_t) = NULL;
+          static void *(*gOrigXpcSendSync)(void *, void *) = NULL;
+
+          static int (*gOrigXpcPipeReply)(void *) = NULL;
+          static int (*gOrigXpcPipeSimple)(void *, void *) = NULL;
+          static int (*gOrigXpcPipeRoutine)(void *, void *, void **) = NULL;
+          static int (*gOrigXpcPipeRoutineFlags)(void *, void *, void **, uint64_t) = NULL;
+
+          static int (*gOrigXpcSessSend)(void *, void *) = NULL;
+          static void (*gOrigXpcSessAsync)(void *, void *, void *) = NULL;
+          static void *(*gOrigXpcSessSync)(void *, void *, void **) = NULL;
+
+          static SInt32 (*gOrigCFMPSend)(CFMessagePortRef, SInt32, CFDataRef, CFTimeInterval, CFTimeInterval, CFStringRef, CFDataRef *) = NULL;
+
+          static void (*gOrigDmachSend)(void *, void *, mach_msg_option_t) = NULL;
+          static void (*gOrigDmachSendRes)(void *, void *, mach_msg_option_t, uint32_t, unsigned long *, mach_error_t *) = NULL;
+          static void *(*gOrigDmachSendWait)(void *, void *, mach_msg_option_t) = NULL;
+          static void *(*gOrigDmachSendResWait)(void *, void *, mach_msg_option_t, uint32_t, unsigned long *, mach_error_t *) = NULL;
 
           static void gs_xpc_send_msg(xpc_connection_t conn, xpc_object_t msg) {
-              if (!gInXpcHook) {
-                  gInXpcHook = 1;
-                  gs_handle_outbound_xpc(msg);
-                  gInXpcHook = 0;
-              }
+              if (!gInXpcHook) { gInXpcHook = 1; gs_handle_outbound_xpc(msg); gInXpcHook = 0; }
               if (gOrigXpcSendMsg) gOrigXpcSendMsg(conn, msg);
           }
 
           static void gs_xpc_send_notif(xpc_connection_t conn, xpc_object_t msg) {
-              if (!gInXpcHook) {
-                  gInXpcHook = 1;
-                  gs_handle_outbound_xpc(msg);
-                  gInXpcHook = 0;
-              }
+              if (!gInXpcHook) { gInXpcHook = 1; gs_handle_outbound_xpc(msg); gInXpcHook = 0; }
               if (gOrigXpcSendNotif) gOrigXpcSendNotif(conn, msg);
           }
 
           static void gs_xpc_send_reply(xpc_connection_t conn, xpc_object_t msg, dispatch_queue_t q, xpc_handler_t h) {
-              if (!gInXpcHook) {
-                  gInXpcHook = 1;
-                  gs_handle_outbound_xpc(msg);
-                  gInXpcHook = 0;
-              }
+              if (!gInXpcHook) { gInXpcHook = 1; gs_handle_outbound_xpc(msg); gInXpcHook = 0; }
               if (gOrigXpcSendReply) gOrigXpcSendReply(conn, msg, q, h);
           }
 
-          static xpc_object_t gs_xpc_send_sync(xpc_connection_t conn, xpc_object_t msg) {
-              if (!gInXpcHook) {
+          static void *gs_xpc_send_sync(void *conn, void *msg) {
+              if (!gInXpcHook && msg) { gInXpcHook = 1; gs_handle_outbound_xpc((__bridge xpc_object_t)msg); gInXpcHook = 0; }
+              return gOrigXpcSendSync ? gOrigXpcSendSync(conn, msg) : NULL;
+          }
+
+          static int gs_xpc_pipe_reply(void *reply) {
+              if (!gInXpcHook && reply) {
                   gInXpcHook = 1;
-                  gs_handle_outbound_xpc(msg);
+                  if (gs_handle_outbound_xpc((__bridge xpc_object_t)reply)) atomic_fetch_add(&gIpcPipeRewritten, 1);
                   gInXpcHook = 0;
               }
-              return gOrigXpcSendSync ? gOrigXpcSendSync(conn, msg) : NULL;
+              return gOrigXpcPipeReply ? gOrigXpcPipeReply(reply) : 0;
+          }
+
+          static int gs_xpc_pipe_simple(void *pipe, void *req) {
+              if (!gInXpcHook && req) {
+                  gInXpcHook = 1;
+                  if (gs_handle_outbound_xpc((__bridge xpc_object_t)req)) atomic_fetch_add(&gIpcPipeRewritten, 1);
+                  gInXpcHook = 0;
+              }
+              return gOrigXpcPipeSimple ? gOrigXpcPipeSimple(pipe, req) : 0;
+          }
+
+          static int gs_xpc_pipe_routine(void *pipe, void *req, void **reply) {
+              if (!gInXpcHook && req) {
+                  gInXpcHook = 1;
+                  if (gs_handle_outbound_xpc((__bridge xpc_object_t)req)) atomic_fetch_add(&gIpcPipeRewritten, 1);
+                  gInXpcHook = 0;
+              }
+              return gOrigXpcPipeRoutine ? gOrigXpcPipeRoutine(pipe, req, reply) : 0;
+          }
+
+          static int gs_xpc_pipe_routine_flags(void *pipe, void *req, void **reply, uint64_t flags) {
+              if (!gInXpcHook && req) {
+                  gInXpcHook = 1;
+                  if (gs_handle_outbound_xpc((__bridge xpc_object_t)req)) atomic_fetch_add(&gIpcPipeRewritten, 1);
+                  gInXpcHook = 0;
+              }
+              return gOrigXpcPipeRoutineFlags ? gOrigXpcPipeRoutineFlags(pipe, req, reply, flags) : 0;
+          }
+
+          static int gs_xpc_sess_send(void *sess, void *msg) {
+              if (!gInXpcHook && msg) {
+                  gInXpcHook = 1;
+                  if (gs_handle_outbound_xpc((__bridge xpc_object_t)msg)) atomic_fetch_add(&gIpcSessRewritten, 1);
+                  gInXpcHook = 0;
+              }
+              return gOrigXpcSessSend ? gOrigXpcSessSend(sess, msg) : 0;
+          }
+
+          static void gs_xpc_sess_async(void *sess, void *msg, void *h) {
+              if (!gInXpcHook && msg) {
+                  gInXpcHook = 1;
+                  if (gs_handle_outbound_xpc((__bridge xpc_object_t)msg)) atomic_fetch_add(&gIpcSessRewritten, 1);
+                  gInXpcHook = 0;
+              }
+              if (gOrigXpcSessAsync) gOrigXpcSessAsync(sess, msg, h);
+          }
+
+          static void *gs_xpc_sess_sync(void *sess, void *msg, void **err) {
+              if (!gInXpcHook && msg) {
+                  gInXpcHook = 1;
+                  if (gs_handle_outbound_xpc((__bridge xpc_object_t)msg)) atomic_fetch_add(&gIpcSessRewritten, 1);
+                  gInXpcHook = 0;
+              }
+              return gOrigXpcSessSync ? gOrigXpcSessSync(sess, msg, err) : NULL;
+          }
+
+          static SInt32 gs_cfmp_send(CFMessagePortRef remote, SInt32 msgid, CFDataRef data,
+                                     CFTimeInterval sendTimeout, CFTimeInterval rcvTimeout,
+                                     CFStringRef replyMode, CFDataRef *returnData) {
+              CFDataRef patchedRef = NULL;
+              uint8_t *buf = NULL;
+              if (!gInXpcHook && data && atomic_load_explicit(&gHasRealCoord, memory_order_acquire)) {
+                  gInXpcHook = 1;
+                  double rlat = gLastRealLat, rlon = gLastRealLon;
+                  double flat = 0.0, flon = 0.0;
+                  if (gs_refresh_fake_coord(rlat, rlon, &flat, &flon)) {
+                      const uint8_t *p = CFDataGetBytePtr(data);
+                      CFIndex clen = CFDataGetLength(data);
+                      if (p && clen >= 16) {
+                          uint32_t pairs = 0;
+                          bool na = false, rad = false, f32 = false;
+                          buf = gs_make_patched_blob(p, (size_t)clen, rlat, rlon, flat, flon, &pairs, &na, &rad, &f32);
+                          if (buf) {
+                              patchedRef = CFDataCreate(kCFAllocatorDefault, buf, clen);
+                              if (patchedRef) atomic_fetch_add(&gIpcCfmpRewritten, 1);
+                          }
+                      }
+                  }
+                  gInXpcHook = 0;
+              }
+              SInt32 ret = gOrigCFMPSend ? gOrigCFMPSend(remote, msgid, patchedRef ? patchedRef : data, sendTimeout, rcvTimeout, replyMode, returnData) : kCFMessagePortTransportError;
+              if (patchedRef) CFRelease(patchedRef);
+              if (buf) free(buf);
+              return ret;
+          }
+
+          static void gs_dmach_send(void *dm, void *dmsg, mach_msg_option_t opt) {
+              if (!gInXpcHook && dmsg) { gInXpcHook = 1; gs_handle_outbound_dmach(dmsg); gInXpcHook = 0; }
+              if (gOrigDmachSend) gOrigDmachSend(dm, dmsg, opt);
+          }
+
+          static void gs_dmach_send_res(void *dm, void *dmsg, mach_msg_option_t opt,
+                                        uint32_t flags, unsigned long *res, mach_error_t *err) {
+              if (!gInXpcHook && dmsg) { gInXpcHook = 1; gs_handle_outbound_dmach(dmsg); gInXpcHook = 0; }
+              if (gOrigDmachSendRes) gOrigDmachSendRes(dm, dmsg, opt, flags, res, err);
+          }
+
+          static void *gs_dmach_send_wait(void *dm, void *dmsg, mach_msg_option_t opt) {
+              if (!gInXpcHook && dmsg) { gInXpcHook = 1; gs_handle_outbound_dmach(dmsg); gInXpcHook = 0; }
+              return gOrigDmachSendWait ? gOrigDmachSendWait(dm, dmsg, opt) : NULL;
+          }
+
+          static void *gs_dmach_send_res_wait(void *dm, void *dmsg, mach_msg_option_t opt,
+                                              uint32_t flags, unsigned long *res, mach_error_t *err) {
+              if (!gInXpcHook && dmsg) { gInXpcHook = 1; gs_handle_outbound_dmach(dmsg); gInXpcHook = 0; }
+              return gOrigDmachSendResWait ? gOrigDmachSendResWait(dm, dmsg, opt, flags, res, err) : NULL;
           }
 
           __attribute__((constructor)) static void gs_diag_init(void) {
               gInXpcHook = 1;
+              gBootTime = CFAbsoluteTimeGetCurrent();
+              gDaemonPid = (uint32_t)getpid();
+
+              // Persist last known real coordinate across locationd restarts (zero startup leak window)
+              int rtok = -1;
+              if (notify_register_check(GS_REAL_NOTIFY, &rtok) == NOTIFY_STATUS_OK && rtok != -1) {
+                  uint64_t rv = 0;
+                  if (notify_get_state(rtok, &rv) == NOTIFY_STATUS_OK && rv != 0) {
+                      int32_t ilat = (int32_t)(uint32_t)(rv & 0xFFFFFFFFULL);
+                      int32_t ilon = (int32_t)(uint32_t)((rv >> 32) & 0xFFFFFFFFULL);
+                      double rlat = ilat / 10000.0, rlon = ilon / 10000.0;
+                      if (isfinite(rlat) && isfinite(rlon) && fabs(rlat) <= 90.0 && fabs(rlon) <= 180.0 &&
+                          (fabs(rlat) > 0.1 || fabs(rlon) > 0.1)) {
+                          gLastRealLat = rlat;
+                          gLastRealLon = rlon;
+                          atomic_store_explicit(&gHasRealCoord, 1, memory_order_release);
+                      }
+                  }
+                  notify_cancel(rtok);
+              }
+
               gs_diag_publish();
+
               MSHookFunction((void *)xpc_connection_send_message, (void *)gs_xpc_send_msg, (void **)&gOrigXpcSendMsg);
               if (gOrigXpcSendMsg) atomic_store(&gXpcHookedMsg, 1);
-              void *notifSym = dlsym(RTLD_DEFAULT, "xpc_connection_send_notification");
-              if (notifSym) {
-                  MSHookFunction(notifSym, (void *)gs_xpc_send_notif, (void **)&gOrigXpcSendNotif);
+
+              void *sym = NULL;
+              if ((sym = dlsym(RTLD_DEFAULT, "xpc_connection_send_notification"))) {
+                  MSHookFunction(sym, (void *)gs_xpc_send_notif, (void **)&gOrigXpcSendNotif);
                   if (gOrigXpcSendNotif) atomic_store(&gXpcHookedNotif, 1);
               }
               MSHookFunction((void *)xpc_connection_send_message_with_reply, (void *)gs_xpc_send_reply, (void **)&gOrigXpcSendReply);
               if (gOrigXpcSendReply) atomic_store(&gXpcHookedReply, 1);
-              MSHookFunction((void *)xpc_connection_send_message_with_reply_sync, (void *)gs_xpc_send_sync, (void **)&gOrigXpcSendSync);
-              if (gOrigXpcSendSync) atomic_store(&gXpcHookedSync, 1);
+
+              if ((sym = dlsym(RTLD_DEFAULT, "xpc_connection_send_message_with_reply_sync"))) {
+                  MSHookFunction(sym, (void *)gs_xpc_send_sync, (void **)&gOrigXpcSendSync);
+                  if (gOrigXpcSendSync) atomic_store(&gXpcHookedSync, 1);
+              }
+
+              if ((sym = dlsym(RTLD_DEFAULT, "xpc_pipe_routine_reply"))) {
+                  MSHookFunction(sym, (void *)gs_xpc_pipe_reply, (void **)&gOrigXpcPipeReply);
+                  if (gOrigXpcPipeReply) atomic_store(&gHookedPipe, 1);
+              }
+              if ((sym = dlsym(RTLD_DEFAULT, "xpc_pipe_simpleroutine"))) {
+                  MSHookFunction(sym, (void *)gs_xpc_pipe_simple, (void **)&gOrigXpcPipeSimple);
+                  if (gOrigXpcPipeSimple) atomic_store(&gHookedPipe, 1);
+              }
+              if ((sym = dlsym(RTLD_DEFAULT, "xpc_pipe_routine"))) {
+                  MSHookFunction(sym, (void *)gs_xpc_pipe_routine, (void **)&gOrigXpcPipeRoutine);
+                  if (gOrigXpcPipeRoutine) atomic_store(&gHookedPipe, 1);
+              }
+              if ((sym = dlsym(RTLD_DEFAULT, "xpc_pipe_routine_with_flags"))) {
+                  MSHookFunction(sym, (void *)gs_xpc_pipe_routine_flags, (void **)&gOrigXpcPipeRoutineFlags);
+                  if (gOrigXpcPipeRoutineFlags) atomic_store(&gHookedPipe, 1);
+              }
+
+              if ((sym = dlsym(RTLD_DEFAULT, "xpc_session_send_message"))) {
+                  MSHookFunction(sym, (void *)gs_xpc_sess_send, (void **)&gOrigXpcSessSend);
+                  if (gOrigXpcSessSend) atomic_store(&gHookedSess, 1);
+              }
+              if ((sym = dlsym(RTLD_DEFAULT, "xpc_session_send_message_with_reply_async"))) {
+                  MSHookFunction(sym, (void *)gs_xpc_sess_async, (void **)&gOrigXpcSessAsync);
+                  if (gOrigXpcSessAsync) atomic_store(&gHookedSess, 1);
+              }
+              if ((sym = dlsym(RTLD_DEFAULT, "xpc_session_send_message_with_reply_sync"))) {
+                  MSHookFunction(sym, (void *)gs_xpc_sess_sync, (void **)&gOrigXpcSessSync);
+                  if (gOrigXpcSessSync) atomic_store(&gHookedSess, 1);
+              }
+
+              if ((sym = dlsym(RTLD_DEFAULT, "CFMessagePortSendRequest"))) {
+                  MSHookFunction(sym, (void *)gs_cfmp_send, (void **)&gOrigCFMPSend);
+                  if (gOrigCFMPSend) atomic_store(&gHookedCfmp, 1);
+              }
+
+              gDmmGetMsg = (gs_dmm_get_msg_fn)dlsym(RTLD_DEFAULT, "dispatch_mach_msg_get_msg");
+              if (gDmmGetMsg) {
+                  if ((sym = dlsym(RTLD_DEFAULT, "dispatch_mach_send"))) {
+                      MSHookFunction(sym, (void *)gs_dmach_send, (void **)&gOrigDmachSend);
+                      if (gOrigDmachSend) atomic_store(&gHookedDmach, 1);
+                  }
+                  if ((sym = dlsym(RTLD_DEFAULT, "dispatch_mach_send_with_result"))) {
+                      MSHookFunction(sym, (void *)gs_dmach_send_res, (void **)&gOrigDmachSendRes);
+                      if (gOrigDmachSendRes) atomic_store(&gHookedDmach, 1);
+                  }
+                  if ((sym = dlsym(RTLD_DEFAULT, "dispatch_mach_send_and_wait_for_reply"))) {
+                      MSHookFunction(sym, (void *)gs_dmach_send_wait, (void **)&gOrigDmachSendWait);
+                      if (gOrigDmachSendWait) atomic_store(&gHookedDmach, 1);
+                  }
+                  if ((sym = dlsym(RTLD_DEFAULT, "dispatch_mach_send_with_result_and_wait_for_reply"))) {
+                      MSHookFunction(sym, (void *)gs_dmach_send_res_wait, (void **)&gOrigDmachSendResWait);
+                      if (gOrigDmachSendResWait) atomic_store(&gHookedDmach, 1);
+                  }
+              }
+
               gs_xpc_publish();
               gInXpcHook = 0;
           }'''
@@ -530,20 +1113,35 @@ jobs:
               gs_diag_inc(&gDiagEnter);
               @try {
                   GSLocationFactory *factory = [GSLocationFactory shared];
-                  if (factory.active && [self isKindOfClass:[CLLocation class]]) {
+                  bool active = factory && factory.active;
+                  atomic_store_explicit(&gCachedActive, active ? 1 : 0, memory_order_release);
+                  if (active && [self isKindOfClass:[CLLocation class]]) {
                       CLLocation *real = (CLLocation *)self;
 
                       // Only rewrite plausible position fixes. Region/visit archiving and
                       // other internal round-trips of a CLLocation with an invalid
                       // coordinate are left alone.
                       if (CLLocationCoordinate2DIsValid(real.coordinate)) {
-                          if (fabs(real.coordinate.latitude) > 0.1 || fabs(real.coordinate.longitude) > 0.1) {
-                              gLastRealLat = real.coordinate.latitude;
-                              gLastRealLon = real.coordinate.longitude;
-                              atomic_store_explicit(&gHasRealCoord, 1, memory_order_release);
-                          }
                           [factory noteRealLocation:real];
                           CLLocation *fake = [factory spoofedLocationFromReal:real];
+                          bool hasFake = (fake && CLLocationCoordinate2DIsValid(fake.coordinate));
+                          if (hasFake && gCachedFakeTs == 0.0) {
+                              gCachedFakeLat = fake.coordinate.latitude;
+                              gCachedFakeLon = fake.coordinate.longitude;
+                              gCachedFakeTs = CFAbsoluteTimeGetCurrent();
+                          }
+                          double age = real.timestamp ? fabs([real.timestamp timeIntervalSinceNow]) : 999.0;
+                          if (real.horizontalAccuracy > 0.0 && real.horizontalAccuracy < 10000.0 && age < 30.0) {
+                              gs_note_live_real_coord(real.coordinate.latitude, real.coordinate.longitude,
+                                                      hasFake ? fake.coordinate.latitude : 0.0,
+                                                      hasFake ? fake.coordinate.longitude : 0.0,
+                                                      hasFake);
+                          } else if (!atomic_load_explicit(&gHasRealCoord, memory_order_acquire)) {
+                              gs_note_live_real_coord(real.coordinate.latitude, real.coordinate.longitude,
+                                                      hasFake ? fake.coordinate.latitude : 0.0,
+                                                      hasFake ? fake.coordinate.longitude : 0.0,
+                                                      hasFake);
+                          }
                           if (fake && gEncodeWithCoderOrig) {
                               gs_diag_inc(&gDiagSpoof);
                               if (GEOSHIM_DEBUG_BUILD) {
@@ -583,6 +1181,15 @@ jobs:
                          (unsigned long long)((v >> 16) & 0xFFFF),
                          (unsigned long long)((v >> 32) & 0xFFFF));
               }
+              int pt = -1;
+              if (notify_register_check("xyz.regulad.geoshim.proc", &pt) == NOTIFY_STATUS_OK) {
+                  uint64_t pv = 0;
+                  notify_get_state(pt, &pv);
+                  notify_cancel(pt);
+                  printf("  daemon proc: pid=%u uptime=%us\\n",
+                         (unsigned)(pv & 0xFFFFFFFFULL),
+                         (unsigned)((pv >> 32) & 0xFFFFFFFFULL));
+              }
               int rt = -1;
               if (notify_register_check("xyz.regulad.geoshim.real", &rt) == NOTIFY_STATUS_OK) {
                   uint64_t rv = 0;
@@ -592,26 +1199,45 @@ jobs:
                   int32_t ilon = (int32_t)(uint32_t)((rv >> 32) & 0xFFFFFFFFULL);
                   printf("  real coord:  %.4f, %.4f\\n", ilat / 10000.0, ilon / 10000.0);
               }
-              int xt = -1, xt2 = -1;
-              uint64_t xv = 0, xv2 = 0;
+              int xt = -1, xt2 = -1, xt3 = -1, xt4 = -1;
+              uint64_t xv = 0, xv2 = 0, xv3 = 0, xv4 = 0;
               if (notify_register_check("xyz.regulad.geoshim.xpc", &xt) == NOTIFY_STATUS_OK) {
                   notify_get_state(xt, &xv); notify_cancel(xt);
               }
               if (notify_register_check("xyz.regulad.geoshim.xpc2", &xt2) == NOTIFY_STATUS_OK) {
                   notify_get_state(xt2, &xv2); notify_cancel(xt2);
               }
-              printf("  xpc rewrite: alive=%u hooks=%u/%u/%u/%u blobs=%llu pairs=%llu nonadj=%llu dbls=%llu f32=%llu shmem=%llu\\n",
+              if (notify_register_check("xyz.regulad.geoshim.xpc3", &xt3) == NOTIFY_STATUS_OK) {
+                  notify_get_state(xt3, &xv3); notify_cancel(xt3);
+              }
+              if (notify_register_check("xyz.regulad.geoshim.xpc4", &xt4) == NOTIFY_STATUS_OK) {
+                  notify_get_state(xt4, &xv4); notify_cancel(xt4);
+              }
+              printf("  xpc rewrite: alive=%u hooks=%u/%u/%u/%u/%u/%u/%u/%u blobs=%llu pairs=%llu nonadj=%llu dbls=%llu rad=%llu f32=%llu\\n",
                      (unsigned)((xv >> 63) & 1),
                      (unsigned)((xv >> 62) & 1),
                      (unsigned)((xv >> 61) & 1),
                      (unsigned)((xv >> 60) & 1),
                      (unsigned)((xv >> 59) & 1),
+                     (unsigned)((xv >> 58) & 1),
+                     (unsigned)((xv >> 57) & 1),
+                     (unsigned)((xv >> 56) & 1),
+                     (unsigned)((xv >> 55) & 1),
                      (unsigned long long)((xv >> 20) & 0xFFFFF),
                      (unsigned long long)(xv & 0xFFFFF),
                      (unsigned long long)(xv2 & 0xFFFF),
                      (unsigned long long)((xv2 >> 16) & 0xFFFF),
                      (unsigned long long)((xv2 >> 32) & 0xFFFF),
                      (unsigned long long)((xv2 >> 48) & 0xFFFF));
+              printf("  ipc guards:  post_leak=%llu pipe=%llu sess=%llu cfmp=%llu dmach_in=%llu dmach_ool=%llu flips=%llu shmem=%llu\\n",
+                     (unsigned long long)(xv3 & 0xFFFF),
+                     (unsigned long long)((xv3 >> 16) & 0xFFFF),
+                     (unsigned long long)((xv4 >> 48) & 0xFFFF),
+                     (unsigned long long)((xv3 >> 32) & 0xFFFF),
+                     (unsigned long long)((xv3 >> 48) & 0xFFFF),
+                     (unsigned long long)(xv4 & 0xFFFF),
+                     (unsigned long long)((xv4 >> 16) & 0xFFFF),
+                     (unsigned long long)((xv4 >> 32) & 0xFFFF));
           }
 
           ''' + old_json_anchor
@@ -638,8 +1264,8 @@ jobs:
           shutil.rmtree("layout/Library/PreferenceLoader", ignore_errors=True)
 
           assert plistlib.load(open("GeoShim.plist", "rb")) == {"Filter": {"Executables": ["locationd"]}}
-          assert "gXpcNonAdjRewritten" in open("Tweak.x").read()
-          assert "nonadj=" in open("cli/main.m").read()
+          assert "gIpcDmachInHits" in open("Tweak.x").read()
+          assert "dmach_in=" in open("cli/main.m").read()
           print("patch ok")
           PY
 
@@ -684,8 +1310,8 @@ jobs:
           [ "$(dpkg-deb -f "$DEB" Architecture)" = "iphoneos-arm64e" ] || { echo "bad package arch"; exit 1; }
           dpkg-deb -c "$DEB" | grep -E 'GeoShim\.dylib$|/geoshim$'
           rm -rf /tmp/debx && dpkg-deb -x "$DEB" /tmp/debx
-          strings /tmp/debx/Library/MobileSubstrate/DynamicLibraries/GeoShim.dylib | grep -q "regulad.geoshim.xpc2" || { echo "xpc v2 missing in dylib"; exit 1; }
-          strings /tmp/debx/usr/local/bin/geoshim | grep -q "nonadj=" || { echo "xpc v2 output missing in cli"; exit 1; }
+          strings /tmp/debx/Library/MobileSubstrate/DynamicLibraries/GeoShim.dylib | grep -q "regulad.geoshim.xpc4" || { echo "xpc v3 missing in dylib"; exit 1; }
+          strings /tmp/debx/usr/local/bin/geoshim | grep -q "dmach_in=" || { echo "xpc v3 output missing in cli"; exit 1; }
           python3 -c 'import plistlib; p=plistlib.load(open("/tmp/debx/Library/MobileSubstrate/DynamicLibraries/GeoShim.plist","rb")); assert p=={"Filter":{"Executables":["locationd"]}}, p; print("filter ok")'
 
       - name: Save .deb file
