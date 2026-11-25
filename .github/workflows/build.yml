@@ -2921,7 +2921,7 @@ jobs:
           path: packages/*.deb
           if-no-files-found: error
 
-  publish:
+    publish:
     needs: build
     if: always()
     runs-on: ubuntu-22.04
@@ -2929,7 +2929,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           pattern: geoshim-deb-*
-          merge-multiple: true
+          merge-multiple: false
           path: dist
 
       - name: Publish to GitHub Release
@@ -2937,9 +2937,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          ls -l dist
-          DEB=$(ls dist/*.deb 2>/dev/null | head -n 1)
+          find dist -type f -ls
+          DEB=$(find dist -name '*.deb' | sort | head -n 1)
           if [ -z "$DEB" ]; then echo "no .deb produced"; exit 1; fi
+          rm -rf /tmp/pubcheck && dpkg-deb -x "$DEB" /tmp/pubcheck
           cp "$DEB" dist/geoshim-latest.deb
           gh release view latest-build >/dev/null 2>&1 || \
             gh release create latest-build --title "GeoShim latest build" --notes "Automated build ${GITHUB_SHA}"
