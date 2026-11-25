@@ -3822,7 +3822,7 @@ jobs:
           strings /tmp/debx/usr/local/bin/geoshim | grep -q "dmach_in=" || { echo "xpc release output missing in cli"; exit 1; }
           strings /tmp/debx/Applications/GeoShimApp.app/GeoShimApp | grep -q "tile.openstreetmap.org" || { echo "OSM tile engine missing in app"; exit 1; }
           strings /tmp/debx/Applications/GeoShimApp.app/GeoShimApp | grep -q "GeoShimApp/1.3.1" || { echo "v1.3.1 UA missing in app"; exit 1; }
-          grep -q "<string>1.3.1</string>" /tmp/debx/Applications/GeoShimApp.app/Info.plist || { echo "v1.3.1 Info.plist version missing"; exit 1; }
+          python3 -c 'import plistlib; p=plistlib.load(open("/tmp/debx/Applications/GeoShimApp.app/Info.plist","rb")); assert p.get("CFBundleShortVersionString")=="1.3.1" and p.get("CFBundleVersion")=="5", p; print("Info.plist ok:", p["CFBundleShortVersionString"], "build", p["CFBundleVersion"])'
           [ -f /tmp/debx/Applications/GeoShimApp.app/AppIcon60x60@3x.png ] || { echo "AppIcon missing"; exit 1; }
           ldid -e /tmp/debx/Applications/GeoShimApp.app/GeoShimApp | grep -q "no-sandbox" || { echo "entitlements missing on GeoShimApp"; exit 1; }
           dpkg-deb -I "$DEB" postinst | grep -q "uicache" || { echo "postinst uicache missing"; exit 1; }
