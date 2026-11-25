@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Patch package and enable file logging
+      - name: Patch package, logging and diagnostics
         run: |
           python3 - << 'PY'
           import re, plistlib, shutil
@@ -32,17 +32,170 @@ jobs:
 
           tx = open("Tweak.x").read()
           tx = re.sub(r'#\s*(?:import|include)\s*[<"]libSandy\.h[>"]', '', tx)
-          open("Tweak.x", "w").write(tx)
           with open("GSConfig.m", "a") as f:
               f.write('\nint libSandy_applyProfile(const char *profileName) { (void)profileName; return 0; }\n')
 
           with open("GSCommon.h", "a") as f:
-              f.write('\n#ifdef GEOSHIM_DEBUG\n#include <stdio.h>\nstatic inline void GSLogToFile(NSString *m) { FILE *f = fopen("/var/mobile/geoshim.log", "a"); if (f) { fprintf(f, "%s\\n", m.UTF8String); fclose(f); } }\n#undef GSLog\n#define GSLog(fmt, ...) do { NSString *_gsm = [NSString stringWithFormat:@"[GeoShim] " fmt, ##__VA_ARGS__]; NSLog(@"%@", _gsm); GSLogToFile(_gsm); } while (0)\n#endif\n')
-          assert "GSLogToFile" in open("GSCommon.h").read()
+              f.write(r'''
+          #ifndef GSLOG_DIAG_OVERRIDE
+          #define GSLOG_DIAG_OVERRIDE
+          #import <Foundation/Foundation.h>
+          #import <os/log.h>
+          #include <stdio.h>
+          static inline void GSLogToFile(NSString *m) {
+              const char *paths[] = {
+                  "/private/var/root/Library/Caches/locationd/geoshim.log",
+                  "/private/var/mobile/Library/Caches/locationd/geoshim.log",
+                  [NSTemporaryDirectory() stringByAppendingPathComponent:@"geoshim.log"].UTF8String,
+                  "/var/mobile/geoshim.log",
+                  NULL
+              };
+              for (int i = 0; paths[i]; i++) {
+                  FILE *f = fopen(paths[i], "a");
+                  if (f) { fprintf(f, "%s\n", m.UTF8String); fclose(f); break; }
+              }
+          }
+          static inline void GSLogToOSLog(NSString *m) {
+              static os_log_t gslog;
+              static dispatch_once_t gs_once;
+              dispatch_once(&gs_once, ^{ gslog = os_log_create("xyz.regulad.geoshim", "tweak"); });
+              os_log_fault(gslog, "%{public}s", m.UTF8String);
+          }
+          #undef GSLog
+          #define GSLog(fmt, ...) do { NSString *_gsm = [NSString stringWithFormat:@"[GeoShim] " fmt, ##__VA_ARGS__]; NSLog(@"%@", _gsm); GSLogToFile(_gsm); GSLogToOSLog(_gsm); } while (0)
+          #endif
+          ''')
+          assert "GSLogToOSLog" in open("GSCommon.h").read()
+
+          old_anchor = "static IMP gEncodeWithCoderOrig = NULL;"
+          diag_block = old_anchor + '''
+
+          // --- GeoShim diagnostics: counters over Darwin notify ---
+          #include <notify.h>
+          #include <dispatch/dispatch.h>
+          #include <stdatomic.h>
+          static _Atomic uint32_t gDiagEnter = 0;
+          static _Atomic uint32_t gDiagSpoof = 0;
+          static _Atomic uint32_t gDiagThrow = 0;
+          #define GS_DIAG_NOTIFY "xyz.regulad.geoshim.diag"
+          static void gs_diag_publish(void) {
+              static int tok = -1;
+              static dispatch_once_t once;
+              dispatch_once(&once, ^{ notify_register_check(GS_DIAG_NOTIFY, &tok); });
+              if (tok == -1) return;
+              uint64_t v = (1ULL << 63)
+                         | (uint64_t)(atomic_load(&gDiagEnter) & 0xFFFF)
+                         | ((uint64_t)(atomic_load(&gDiagSpoof) & 0xFFFF) << 16)
+                         | ((uint64_t)(atomic_load(&gDiagThrow) & 0xFFFF) << 32);
+              notify_set_state(tok, v);
+          }
+          __attribute__((constructor)) static void gs_diag_init(void) { gs_diag_publish(); }
+          static void gs_diag_inc(_Atomic uint32_t *c) { atomic_fetch_add(c, 1); gs_diag_publish(); }'''
+          assert tx.count(old_anchor) == 1
+          tx = tx.replace(old_anchor, diag_block, 1)
+
+          old_fn = '''static void gs_encodeWithCoder(id self, SEL _cmd, NSCoder *coder) {
+              @try {
+                  GSLocationFactory *factory = [GSLocationFactory shared];
+                  if (factory.active && [self isKindOfClass:[CLLocation class]]) {
+                      CLLocation *real = (CLLocation *)self;
+
+                      // Only rewrite plausible position fixes. Region/visit archiving and
+                      // other internal round-trips of a CLLocation with an invalid
+                      // coordinate are left alone.
+                      if (CLLocationCoordinate2DIsValid(real.coordinate)) {
+                          [factory noteRealLocation:real];
+                          CLLocation *fake = [factory spoofedLocationFromReal:real];
+                          if (fake && gEncodeWithCoderOrig) {
+                              if (GEOSHIM_DEBUG_BUILD) {
+                                  GSLog(@"locationd: encode %f,%f -> %f,%f",
+                                        real.coordinate.latitude, real.coordinate.longitude,
+                                        fake.coordinate.latitude, fake.coordinate.longitude);
+                              }
+                              ((void (*)(id, SEL, NSCoder *))gEncodeWithCoderOrig)(fake, _cmd, coder);
+                              return;
+                          }
+                      }
+                  }
+              } @catch (NSException *e) {
+                  GSLog(@"locationd: encodeWithCoder substitution failed: %@", e);
+              }
+
+              if (gEncodeWithCoderOrig) {
+                  ((void (*)(id, SEL, NSCoder *))gEncodeWithCoderOrig)(self, _cmd, coder);
+              }
+          }'''
+
+          new_fn = '''static void gs_encodeWithCoder(id self, SEL _cmd, NSCoder *coder) {
+              gs_diag_inc(&gDiagEnter);
+              @try {
+                  GSLocationFactory *factory = [GSLocationFactory shared];
+                  if (factory.active && [self isKindOfClass:[CLLocation class]]) {
+                      CLLocation *real = (CLLocation *)self;
+
+                      // Only rewrite plausible position fixes. Region/visit archiving and
+                      // other internal round-trips of a CLLocation with an invalid
+                      // coordinate are left alone.
+                      if (CLLocationCoordinate2DIsValid(real.coordinate)) {
+                          [factory noteRealLocation:real];
+                          CLLocation *fake = [factory spoofedLocationFromReal:real];
+                          if (fake && gEncodeWithCoderOrig) {
+                              gs_diag_inc(&gDiagSpoof);
+                              if (GEOSHIM_DEBUG_BUILD) {
+                                  GSLog(@"locationd: encode %f,%f -> %f,%f",
+                                        real.coordinate.latitude, real.coordinate.longitude,
+                                        fake.coordinate.latitude, fake.coordinate.longitude);
+                              }
+                              ((void (*)(id, SEL, NSCoder *))gEncodeWithCoderOrig)(fake, _cmd, coder);
+                              return;
+                          }
+                      }
+                  }
+              } @catch (NSException *e) {
+                  gs_diag_inc(&gDiagThrow);
+                  GSLog(@"locationd: encodeWithCoder substitution failed: %@", e);
+              }
+
+              if (gEncodeWithCoderOrig) {
+                  ((void (*)(id, SEL, NSCoder *))gEncodeWithCoderOrig)(self, _cmd, coder);
+              }
+          }'''
+          assert tx.count(old_fn) == 1
+          tx = tx.replace(old_fn, new_fn, 1)
+          open("Tweak.x", "w").write(tx)
+
+          m = open("cli/main.m").read()
+          old_json_anchor = "static int commandStatusJSON(void) {"
+          diag_fn = '''static void printEncodeDiag(void) {
+              int tok = -1;
+              if (notify_register_check("xyz.regulad.geoshim.diag", &tok) != NOTIFY_STATUS_OK) {
+                  printf("  encode hook: diag unavailable\\n");
+                  return;
+              }
+              uint64_t v = 0;
+              notify_get_state(tok, &v);
+              notify_cancel(tok);
+              printf("  encode hook: diag_alive=%u calls=%llu spoofed=%llu threw=%llu\\n",
+                     (unsigned)((v >> 63) & 1),
+                     (unsigned long long)(v & 0xFFFF),
+                     (unsigned long long)((v >> 16) & 0xFFFF),
+                     (unsigned long long)((v >> 32) & 0xFFFF));
+          }
+
+          ''' + old_json_anchor
+          assert m.count(old_json_anchor) == 1
+          m = m.replace(old_json_anchor, diag_fn, 1)
+
+          old_visit = '''        printf("  visit hook:      %s\\n", (st & GS_STATUS_VISIT_HOOK) ? "installed" : "missing");'''
+          new_visit = old_visit + '''
+                  printEncodeDiag();'''
+          assert m.count(old_visit) == 1
+          m = m.replace(old_visit, new_visit, 1)
+          open("cli/main.m", "w").write(m)
 
           mk = open("Makefile").read()
           mk = re.sub(r'(?m)^(\s*\w+_LIBRARIES\s*=.*)$',
-                      lambda m: re.sub(r'\bsandy\b', '', m.group(1)), mk)
+                      lambda mm: re.sub(r'\bsandy\b', '', mm.group(1)), mk)
           mk = re.sub(r'(?m)^\s*SUBPROJECTS\s*\+=\s*prefs\s*\n', '', mk)
           open("Makefile", "w").write(mk)
 
@@ -58,6 +211,8 @@ jobs:
           assert "SUBPROJECTS += prefs" not in mk2
           assert "libsandy" not in open("control").read().lower()
           assert "libSandy_applyProfile" in open("GSConfig.m").read()
+          assert "gs_diag_inc(&gDiagSpoof);" in open("Tweak.x").read()
+          assert "printEncodeDiag();" in open("cli/main.m").read()
           print("patch ok")
           PY
 
@@ -76,7 +231,7 @@ jobs:
           export THEOS="$HOME/theos"
           make package ARCHS=arm64e
 
-      - name: Verify ABI, package and logging code
+      - name: Verify ABI, package, diagnostics
         run: |
           python3 - << 'PY'
           import glob, os, struct, sys
@@ -102,7 +257,9 @@ jobs:
           [ "$(dpkg-deb -f "$DEB" Architecture)" = "iphoneos-arm64e" ] || { echo "bad package arch"; exit 1; }
           dpkg-deb -c "$DEB" | grep -E 'GeoShim\.dylib$|/geoshim$'
           rm -rf /tmp/debx && dpkg-deb -x "$DEB" /tmp/debx
-          strings /tmp/debx/Library/MobileSubstrate/DynamicLibraries/GeoShim.dylib | grep -q "/var/mobile/geoshim.log" || { echo "file logging not compiled in"; exit 1; }
+          strings /tmp/debx/Library/MobileSubstrate/DynamicLibraries/GeoShim.dylib | grep -q "regulad.geoshim.diag" || { echo "diag counters missing in dylib"; exit 1; }
+          strings /tmp/debx/Library/MobileSubstrate/DynamicLibraries/GeoShim.dylib | grep -q "geoshim.log" || { echo "GSLog override missing in dylib"; exit 1; }
+          strings /tmp/debx/usr/local/bin/geoshim | grep -q "encode hook: diag_alive=" || { echo "diag output missing in cli"; exit 1; }
           python3 -c 'import plistlib; p=plistlib.load(open("/tmp/debx/Library/MobileSubstrate/DynamicLibraries/GeoShim.plist","rb")); assert p=={"Filter":{"Executables":["locationd"]}}, p; print("filter ok")'
 
       - name: Save .deb file
