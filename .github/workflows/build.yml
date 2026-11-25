@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Patch package with full iOS 18 IPC/XPC/Mach rewriter v3
+      - name: Patch package (iOS 18 IPC/XPC/Mach rewriter release)
         run: |
           python3 - << 'PY'
           import re, plistlib, shutil
@@ -35,28 +35,10 @@ jobs:
           with open("GSConfig.m", "a") as f:
               f.write('\nint libSandy_applyProfile(const char *profileName) { (void)profileName; return 0; }\n')
 
-          with open("GSCommon.h", "a") as f:
-              f.write(r'''
-          #ifndef GSLOG_DIAG_OVERRIDE
-          #define GSLOG_DIAG_OVERRIDE
-          #import <Foundation/Foundation.h>
-          #import <os/log.h>
-          #include <stdio.h>
-          static inline void GSLogToOSLog(NSString *m) {
-              static os_log_t gslog;
-              static dispatch_once_t gs_once;
-              dispatch_once(&gs_once, ^{ gslog = os_log_create("xyz.regulad.geoshim", "tweak"); });
-              os_log_fault(gslog, "%{public}s", m.UTF8String);
-          }
-          #undef GSLog
-          #define GSLog(fmt, ...) do { NSString *_gsm = [NSString stringWithFormat:@"[GeoShim] " fmt, ##__VA_ARGS__]; NSLog(@"%@", _gsm); GSLogToOSLog(_gsm); } while (0)
-          #endif
-          ''')
-
           old_anchor = "static IMP gEncodeWithCoderOrig = NULL;"
           xpc_rewriter = old_anchor + r'''
 
-          // --- GeoShim iOS 18 Total IPC Rewriter v3 (XPC + Pipe + Session + CFMessagePort + dispatch_mach) ---
+          // --- GeoShim iOS 18 Total IPC Rewriter (Release) ---
           #include <notify.h>
           #include <dispatch/dispatch.h>
           #include <CoreFoundation/CoreFoundation.h>
@@ -256,14 +238,12 @@ jobs:
               if (!isfinite(lat) || !isfinite(lon) || fabs(lat) > 90.0 || fabs(lon) > 180.0) return;
               if (fabs(lat) < 0.1 && fabs(lon) < 0.1) return;
               if (atomic_load_explicit(&gHasRealCoord, memory_order_acquire)) {
-                  // Ignore coordinates that are actually our own spoofed target when target is far from real
                   if (hasFake && (fabs(flat - gLastRealLat) > 0.08 || fabs(flon - gLastRealLon) > 0.08)) {
                       if (fabs(lat - flat) < 0.05 && fabs(lon - flon) < 0.05) {
                           atomic_fetch_add(&gAnchorFlips, 1);
                           return;
                       }
                   }
-                  // Reject single stray geofence/region jumps > 2 deg unless 3 consecutive fresh fixes agree
                   if (fabs(lat - gLastRealLat) > 2.0 || fabs(lon - gLastRealLon) > 2.0) {
                       atomic_fetch_add(&gAnchorFlips, 1);
                       if (fabs(lat - gCandRealLat) < 0.5 && fabs(lon - gCandRealLon) < 0.5) {
@@ -281,7 +261,6 @@ jobs:
               atomic_store_explicit(&gHasRealCoord, 1, memory_order_release);
           }
 
-          // Fast read-only leak detector (excludes already-fake coordinates)
           static bool gs_buf_has_unpatched_real(const uint8_t *src, size_t len,
                                                 double rlat, double rlon,
                                                 double flat, double flon) {
@@ -367,7 +346,6 @@ jobs:
 
               uint32_t adjPairs = 0, radPairs = 0, f32Pairs = 0, nonAdjVals = 0;
 
-              // Pass 1: Adjacent pairs (LE/BE double degrees, LE/BE double radians, LE/BE float32 degrees)
               for (size_t off = 0; off + 8 <= lim; off++) {
                   if (off + 16 <= lim) {
                       double d0, d1;
@@ -445,7 +423,6 @@ jobs:
                   }
               }
 
-              // Pass 2: Non-adjacent LE/BE doubles ONLY if BOTH unpatched lat AND unpatched lon still remain
               if (fabs(rlat) > 1.0 && fabs(rlon) > 1.0) {
                   bool remLatLE = false, remLonLE = false, remLatBE = false, remLonBE = false;
                   for (size_t off = 0; off + 8 <= lim; off++) {
@@ -752,7 +729,6 @@ jobs:
               return did;
           }
 
-          // Pure lock-free C catch-all below XPC/NSXPC/dispatch_mach (zero ObjC, zero malloc, zero notify calls)
           typedef mach_msg_header_t *(*gs_dmm_get_msg_fn)(void *dmsg, size_t *size_ptr);
           static gs_dmm_get_msg_fn gDmmGetMsg = NULL;
 
@@ -980,7 +956,6 @@ jobs:
               gBootTime = CFAbsoluteTimeGetCurrent();
               gDaemonPid = (uint32_t)getpid();
 
-              // Persist last known real coordinate across locationd restarts (zero startup leak window)
               int rtok = -1;
               if (notify_register_check(GS_REAL_NOTIFY, &rtok) == NOTIFY_STATUS_OK && rtok != -1) {
                   uint64_t rv = 0;
@@ -1115,48 +1090,47 @@ jobs:
                   GSLocationFactory *factory = [GSLocationFactory shared];
                   bool active = factory && factory.active;
                   atomic_store_explicit(&gCachedActive, active ? 1 : 0, memory_order_release);
-                  if (active && [self isKindOfClass:[CLLocation class]]) {
+                  if ([self isKindOfClass:[CLLocation class]]) {
                       CLLocation *real = (CLLocation *)self;
 
-                      // Only rewrite plausible position fixes. Region/visit archiving and
-                      // other internal round-trips of a CLLocation with an invalid
-                      // coordinate are left alone.
                       if (CLLocationCoordinate2DIsValid(real.coordinate)) {
-                          [factory noteRealLocation:real];
-                          CLLocation *fake = [factory spoofedLocationFromReal:real];
-                          bool hasFake = (fake && CLLocationCoordinate2DIsValid(fake.coordinate));
-                          if (hasFake && gCachedFakeTs == 0.0) {
-                              gCachedFakeLat = fake.coordinate.latitude;
-                              gCachedFakeLon = fake.coordinate.longitude;
-                              gCachedFakeTs = CFAbsoluteTimeGetCurrent();
-                          }
                           double age = real.timestamp ? fabs([real.timestamp timeIntervalSinceNow]) : 999.0;
-                          if (real.horizontalAccuracy > 0.0 && real.horizontalAccuracy < 10000.0 && age < 30.0) {
-                              gs_note_live_real_coord(real.coordinate.latitude, real.coordinate.longitude,
-                                                      hasFake ? fake.coordinate.latitude : 0.0,
-                                                      hasFake ? fake.coordinate.longitude : 0.0,
-                                                      hasFake);
-                          } else if (!atomic_load_explicit(&gHasRealCoord, memory_order_acquire)) {
-                              gs_note_live_real_coord(real.coordinate.latitude, real.coordinate.longitude,
-                                                      hasFake ? fake.coordinate.latitude : 0.0,
-                                                      hasFake ? fake.coordinate.longitude : 0.0,
-                                                      hasFake);
-                          }
-                          if (fake && gEncodeWithCoderOrig) {
-                              gs_diag_inc(&gDiagSpoof);
-                              if (GEOSHIM_DEBUG_BUILD) {
-                                  GSLog(@"locationd: encode %f,%f -> %f,%f",
-                                        real.coordinate.latitude, real.coordinate.longitude,
-                                        fake.coordinate.latitude, fake.coordinate.longitude);
+                          if (!active) {
+                              if (real.horizontalAccuracy > 0.0 && real.horizontalAccuracy < 10000.0 && age < 30.0) {
+                                  gs_note_live_real_coord(real.coordinate.latitude, real.coordinate.longitude, 0.0, 0.0, false);
+                                  gs_diag_publish();
                               }
-                              ((void (*)(id, SEL, NSCoder *))gEncodeWithCoderOrig)(fake, _cmd, coder);
-                              return;
+                          } else {
+                              [factory noteRealLocation:real];
+                              CLLocation *fake = [factory spoofedLocationFromReal:real];
+                              bool hasFake = (fake && CLLocationCoordinate2DIsValid(fake.coordinate));
+                              if (hasFake && gCachedFakeTs == 0.0) {
+                                  gCachedFakeLat = fake.coordinate.latitude;
+                                  gCachedFakeLon = fake.coordinate.longitude;
+                                  gCachedFakeTs = CFAbsoluteTimeGetCurrent();
+                              }
+                              if (real.horizontalAccuracy > 0.0 && real.horizontalAccuracy < 10000.0 && age < 30.0) {
+                                  gs_note_live_real_coord(real.coordinate.latitude, real.coordinate.longitude,
+                                                          hasFake ? fake.coordinate.latitude : 0.0,
+                                                          hasFake ? fake.coordinate.longitude : 0.0,
+                                                          hasFake);
+                              } else if (!atomic_load_explicit(&gHasRealCoord, memory_order_acquire)) {
+                                  gs_note_live_real_coord(real.coordinate.latitude, real.coordinate.longitude,
+                                                          hasFake ? fake.coordinate.latitude : 0.0,
+                                                          hasFake ? fake.coordinate.longitude : 0.0,
+                                                          hasFake);
+                              }
+                              if (fake && gEncodeWithCoderOrig) {
+                                  gs_diag_inc(&gDiagSpoof);
+                                  ((void (*)(id, SEL, NSCoder *))gEncodeWithCoderOrig)(fake, _cmd, coder);
+                                  return;
+                              }
                           }
                       }
                   }
               } @catch (NSException *e) {
                   gs_diag_inc(&gDiagThrow);
-                  GSLog(@"locationd: encodeWithCoder substitution failed: %@", e);
+                  (void)e;
               }
 
               if (gEncodeWithCoderOrig) {
@@ -1279,10 +1253,10 @@ jobs:
           tar -xf /tmp/sdk.tar.xz -C "$HOME/theos/sdks"
           ls "$HOME/theos/sdks"
 
-      - name: Build .deb (debug build)
+      - name: Build .deb (release build)
         run: |
           export THEOS="$HOME/theos"
-          make package ARCHS=arm64e
+          make package FINALPACKAGE=1 ARCHS=arm64e
 
       - name: Verify ABI, package, diagnostics
         run: |
@@ -1310,8 +1284,8 @@ jobs:
           [ "$(dpkg-deb -f "$DEB" Architecture)" = "iphoneos-arm64e" ] || { echo "bad package arch"; exit 1; }
           dpkg-deb -c "$DEB" | grep -E 'GeoShim\.dylib$|/geoshim$'
           rm -rf /tmp/debx && dpkg-deb -x "$DEB" /tmp/debx
-          strings /tmp/debx/Library/MobileSubstrate/DynamicLibraries/GeoShim.dylib | grep -q "regulad.geoshim.xpc4" || { echo "xpc v3 missing in dylib"; exit 1; }
-          strings /tmp/debx/usr/local/bin/geoshim | grep -q "dmach_in=" || { echo "xpc v3 output missing in cli"; exit 1; }
+          strings /tmp/debx/Library/MobileSubstrate/DynamicLibraries/GeoShim.dylib | grep -q "regulad.geoshim.xpc4" || { echo "xpc release missing in dylib"; exit 1; }
+          strings /tmp/debx/usr/local/bin/geoshim | grep -q "dmach_in=" || { echo "xpc release output missing in cli"; exit 1; }
           python3 -c 'import plistlib; p=plistlib.load(open("/tmp/debx/Library/MobileSubstrate/DynamicLibraries/GeoShim.plist","rb")); assert p=={"Filter":{"Executables":["locationd"]}}, p; print("filter ok")'
 
       - name: Save .deb file
