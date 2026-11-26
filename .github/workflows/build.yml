@@ -27,7 +27,7 @@ jobs:
           python3 - << 'PY'
           import urllib.request, urllib.error, json, sys
 
-          ua = "GeoShimApp/1.3.1 (+https://github.com/nikotbilisi/GeoShim)"
+          ua = "GeoShimApp/1.4 (+https://github.com/nikotbilisi/GeoShim)"
           # Dense Manhattan tile z=14, x=4825, y=6156
           tiles = [
               ("OSM", "https://tile.openstreetmap.org/14/4825/6156.png"),
@@ -58,7 +58,7 @@ jobs:
               print(f"Photon CI check note: {e}")
           PY
 
-      - name: Patch daemon (release v1.3.1 fast-path) + native GeoShimApp v1.3.1
+      - name: Patch daemon (release v1.3.1 fast-path) + native GeoShimApp v1.4
         run: |
           python3 - << 'PY'
           import os, re, plistlib, shutil, struct, zlib, math
@@ -1452,7 +1452,7 @@ jobs:
           m = m.replace(old_visit, new_visit, 1)
           open("cli/main.m", "w").write(m)
 
-          # 5. Native GeoShimApp v1.3.1 (60 FPS inertia/zoom, pinch-lock, NSNull-safe search, EINTR-safe CLI, instant reload)
+          # 5. Native GeoShimApp v1.4 (center crosshair UX, swipeable chip bar, collapsible sheet, reverse geocode, MapTiler HD @2x)
           os.makedirs("app/Resources", exist_ok=True)
 
           def make_icon_png(size, out_path):
@@ -1539,9 +1539,9 @@ jobs:
               <key>CFBundlePackageType</key>
               <string>APPL</string>
               <key>CFBundleShortVersionString</key>
-              <string>1.3.1</string>
+              <string>1.4</string>
               <key>CFBundleVersion</key>
-              <string>5</string>
+              <string>6</string>
               <key>CFBundleIcons</key>
               <dict>
                   <key>CFBundlePrimaryIcon</key>
@@ -1648,12 +1648,13 @@ jobs:
           static NSString * const kAltitudeKey     = @"GSAppAltitudeV1";
           static NSString * const kJitterIdxKey    = @"GSAppJitterIdxV1";
           static NSString * const kJitterCapKey    = @"GSAppJitterCapV1";
-          static NSString * const kMapStyleKey     = @"GSAppMapStyleV2";
+          static NSString * const kMapStyleKey     = @"GSAppMapStyleV3";
+          static NSString * const kMapTilerKey     = @"GSAppMapTilerKeyV1";
           static NSString * const kLastLatKey      = @"GSAppLastLatV1";
           static NSString * const kLastLonKey      = @"GSAppLastLonV1";
           static NSString * const kSearchCacheKey  = @"GSAppSearchCacheV1";
           static NSString * const kRecentPlacesKey = @"GSAppRecentPlacesV1";
-          static NSString * const kTileUA          = @"GeoShimApp/1.3.1 (+https://github.com/nikotbilisi/GeoShim)";
+          static NSString * const kTileUA          = @"GeoShimApp/1.4 (+https://github.com/nikotbilisi/GeoShim)";
 
           static NSString *gsStr(id v) {
             if (![v isKindOfClass:[NSString class]]) return nil;
@@ -1857,6 +1858,17 @@ jobs:
             return [[s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] lowercaseString] ?: @"";
           }
 
+          // UIScrollView subclass that allows smooth horizontal swiping even when a touch begins on a UIButton chip
+          @interface GSChipScrollView : UIScrollView
+          @end
+
+          @implementation GSChipScrollView
+          - (BOOL)touchesShouldCancelInContentView:(UIView *)view {
+            (void)view;
+            return YES;
+          }
+          @end
+
           // Weak proxy to eliminate CADisplayLink retain cycles
           @interface GSDisplayLinkProxy : NSObject
           @property (nonatomic, weak) id target;
@@ -1874,7 +1886,7 @@ jobs:
           }
           @end
 
-          // --- Pure UIKit + NSURLSession 60 FPS Web Mercator Tile Map ---
+          // --- Pure UIKit + NSURLSession 60 FPS Web Mercator Tile Map (Center Crosshair + MapTiler @2x HD) ---
           static inline double gsWorldSize(double z) { return 256.0 * pow(2.0, z); }
           static inline double gsLonToX(double lon, double z) { return (lon + 180.0) / 360.0 * gsWorldSize(z); }
           static inline double gsLatToY(double lat, double z) {
@@ -1892,18 +1904,28 @@ jobs:
           @property (nonatomic, assign) double centerLat;
           @property (nonatomic, assign) double centerLon;
           @property (nonatomic, assign) double zoom;
-          @property (nonatomic, assign) CLLocationCoordinate2D pinCoord;
           @property (nonatomic, assign) CLLocationCoordinate2D realCoord;
           @property (nonatomic, assign) BOOL hasRealCoord;
+          @property (nonatomic, assign) CLLocationCoordinate2D activeSpoofCoord;
+          @property (nonatomic, assign) BOOL hasActiveSpoofCoord;
           @property (nonatomic, assign) BOOL spoofActive;
-          @property (nonatomic, assign) NSInteger styleIndex; // 0=OSM, 1=Esri Satellite, 2=Esri Streets
-          @property (nonatomic, copy) void (^onPinChanged)(CLLocationCoordinate2D coord);
+          @property (nonatomic, copy) NSString *mapTilerKey;
+          // Without MapTiler key: 0=OSM, 1=Esri Satellite, 2=Esri Streets
+          // With MapTiler key:    0=Streets HD, 1=Dark HD, 2=Hybrid HD, 3=OSM
+          @property (nonatomic, assign) NSInteger styleIndex;
+
+          @property (nonatomic, copy) void (^onCenterChanged)(CLLocationCoordinate2D coord);
+          @property (nonatomic, copy) void (^onCenterSettled)(CLLocationCoordinate2D coord);
           @property (nonatomic, copy) void (^onTileError)(NSString * _Nullable msg);
           @property (nonatomic, copy) void (^onInteraction)(void);
 
           @property (nonatomic, strong) UIView *tilesContainer;
           @property (nonatomic, strong) UIView *realDotView;
+          @property (nonatomic, strong) UIView *activeDotView;
+          @property (nonatomic, strong) UIView *targetGroundDot;
           @property (nonatomic, strong) UIImageView *pinView;
+          @property (nonatomic, assign) BOOL pinLifted;
+
           @property (nonatomic, strong) NSMutableDictionary<NSString *, UIImageView *> *visibleTiles;
           @property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *viewCacheKeys;
           @property (nonatomic, strong) NSCache<NSString *, UIImage *> *tileCache;
@@ -1911,7 +1933,7 @@ jobs:
           @property (nonatomic, strong) NSURLSession *session;
 
           @property (nonatomic, strong) CADisplayLink *displayLink;
-          @property (nonatomic, assign) NSInteger animMode; // 0=idle, 1=pan inertia, 2=smooth zoom
+          @property (nonatomic, assign) NSInteger animMode; // 0=idle, 1=pan inertia, 2=smooth zoom, 3=smooth glide to coord
           @property (nonatomic, assign) CFTimeInterval lastFrameTs;
           @property (nonatomic, assign) double panVelX;
           @property (nonatomic, assign) double panVelY;
@@ -1922,18 +1944,32 @@ jobs:
           @property (nonatomic, assign) CGPoint zoomAnchorPt;
           @property (nonatomic, assign) CFTimeInterval zoomStartTs;
           @property (nonatomic, assign) CFTimeInterval zoomDuration;
+          @property (nonatomic, assign) double glideStartX;
+          @property (nonatomic, assign) double glideStartY;
+          @property (nonatomic, assign) double glideTargetX;
+          @property (nonatomic, assign) double glideTargetY;
+          @property (nonatomic, assign) CFTimeInterval glideStartTs;
+          @property (nonatomic, assign) CFTimeInterval glideDuration;
 
+          @property (nonatomic, weak) UIPanGestureRecognizer *panGR;
           @property (nonatomic, weak) UIPinchGestureRecognizer *pinchGR;
           @property (nonatomic, assign) CFTimeInterval pinchEndedTs;
           @property (nonatomic, assign) BOOL pinchNeedsReanchor;
           @property (nonatomic, assign) double pinchStartZoom;
           @property (nonatomic, assign) double pinchAnchorLat;
           @property (nonatomic, assign) double pinchAnchorLon;
+          @property (nonatomic, assign) CFTimeInterval lastTileErrToastTs;
+
+          - (BOOL)hasMapTiler;
+          - (NSInteger)styleCount;
+          - (NSString *)currentStyleTitle;
           - (void)reloadTiles;
           - (void)clearVisibleTiles;
           - (void)stopAnimations;
+          - (void)updateMarkers;
           - (void)zoomBy:(double)delta;
           - (void)animateZoomTo:(double)targetZ anchorPoint:(CGPoint)pt duration:(CFTimeInterval)dur;
+          - (void)glideToCoord:(CLLocationCoordinate2D)coord duration:(CFTimeInterval)dur;
           @end
 
           @implementation GSTileMapView
@@ -1941,7 +1977,6 @@ jobs:
           - (instancetype)initWithFrame:(CGRect)frame {
             self = [super initWithFrame:frame];
             if (self) {
-              self.backgroundColor = [UIColor colorWithRed:0.86 green:0.89 blue:0.92 alpha:1.0];
               self.clipsToBounds = YES;
               self.multipleTouchEnabled = YES;
 
@@ -1953,16 +1988,16 @@ jobs:
               _inFlightTasks = [NSMutableDictionary dictionary];
 
               NSURL *cachesDir = [NSFileManager.defaultManager URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask].firstObject;
-              NSURL *tileDiskDir = [cachesDir URLByAppendingPathComponent:@"GSTileCache"];
-              NSURLCache *diskCache = [[NSURLCache alloc] initWithMemoryCapacity:32 * 1024 * 1024
-                                          diskCapacity:100 * 1024 * 1024
+              NSURL *tileDiskDir = [cachesDir URLByAppendingPathComponent:@"GSTileCacheV4"];
+              NSURLCache *diskCache = [[NSURLCache alloc] initWithMemoryCapacity:48 * 1024 * 1024
+                                          diskCapacity:150 * 1024 * 1024
                                           directoryURL:tileDiskDir];
 
               NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
               cfg.URLCache = diskCache;
               cfg.requestCachePolicy = NSURLRequestReturnCacheDataElseLoad;
               cfg.timeoutIntervalForRequest = 12.0;
-              cfg.HTTPMaximumConnectionsPerHost = 4;
+              cfg.HTTPMaximumConnectionsPerHost = 6;
               cfg.HTTPAdditionalHeaders = @{@"User-Agent": kTileUA};
               _session = [NSURLSession sessionWithConfiguration:cfg];
 
@@ -1971,6 +2006,7 @@ jobs:
               _tilesContainer.userInteractionEnabled = NO;
               [self addSubview:_tilesContainer];
 
+              // Blue dot: real GPS position
               _realDotView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 16, 16)];
               _realDotView.backgroundColor = UIColor.systemBlueColor;
               _realDotView.layer.cornerRadius = 8;
@@ -1983,8 +2019,34 @@ jobs:
               _realDotView.userInteractionEnabled = NO;
               [self addSubview:_realDotView];
 
-              _pinView = [[UIImageView alloc] initWithFrame:CGRectMake(0, 0, 42, 42)];
-              UIImageSymbolConfiguration *pcfg = [UIImageSymbolConfiguration configurationWithPointSize:36 weight:UIImageSymbolWeightBold];
+              // Green ring dot: currently active spoofed position (visible when panned away from active point)
+              _activeDotView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 22, 22)];
+              _activeDotView.backgroundColor = [UIColor.systemGreenColor colorWithAlphaComponent:0.28];
+              _activeDotView.layer.cornerRadius = 11;
+              _activeDotView.layer.borderColor = UIColor.systemGreenColor.CGColor;
+              _activeDotView.layer.borderWidth = 2.0;
+              UIView *activeCore = [[UIView alloc] initWithFrame:CGRectMake(6, 6, 10, 10)];
+              activeCore.backgroundColor = UIColor.systemGreenColor;
+              activeCore.layer.cornerRadius = 5;
+              activeCore.layer.borderColor = UIColor.whiteColor.CGColor;
+              activeCore.layer.borderWidth = 1.5;
+              [_activeDotView addSubview:activeCore];
+              _activeDotView.hidden = YES;
+              _activeDotView.userInteractionEnabled = NO;
+              [self addSubview:_activeDotView];
+
+              // Exact ground crosshair dot right under center pin tip
+              _targetGroundDot = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 8, 8)];
+              _targetGroundDot.backgroundColor = [UIColor.blackColor colorWithAlphaComponent:0.45];
+              _targetGroundDot.layer.cornerRadius = 4;
+              _targetGroundDot.layer.borderColor = [UIColor.whiteColor colorWithAlphaComponent:0.85].CGColor;
+              _targetGroundDot.layer.borderWidth = 1.5;
+              _targetGroundDot.userInteractionEnabled = NO;
+              [self addSubview:_targetGroundDot];
+
+              // Uber-style fixed center crosshair pin
+              _pinView = [[UIImageView alloc] initWithFrame:CGRectMake(0, 0, 44, 44)];
+              UIImageSymbolConfiguration *pcfg = [UIImageSymbolConfiguration configurationWithPointSize:38 weight:UIImageSymbolWeightBold];
               _pinView.image = [UIImage systemImageNamed:@"mappin.circle.fill" withConfiguration:pcfg];
               _pinView.contentMode = UIViewContentModeScaleAspectFit;
               _pinView.tintColor = UIColor.systemRedColor;
@@ -1999,6 +2061,7 @@ jobs:
               pan.maximumNumberOfTouches = 2;
               pan.delegate = self;
               [self addGestureRecognizer:pan];
+              _panGR = pan;
 
               UIPinchGestureRecognizer *pinch = [[UIPinchGestureRecognizer alloc] initWithTarget:self action:@selector(handlePinch:)];
               pinch.delegate = self;
@@ -2023,8 +2086,66 @@ jobs:
               tap.delegate = self;
               [tap requireGestureRecognizerToFail:doubleTap];
               [self addGestureRecognizer:tap];
+
+              [self updateBackgroundTone];
             }
             return self;
+          }
+
+          - (BOOL)hasMapTiler {
+            return self.mapTilerKey.length >= 8;
+          }
+
+          - (NSInteger)styleCount {
+            return [self hasMapTiler] ? 4 : 3;
+          }
+
+          - (NSString *)currentStyleTitle {
+            if ([self hasMapTiler]) {
+              switch (self.styleIndex % 4) {
+                case 1: return @"  Тёмная HD ▾  ";
+                case 2: return @"  Гибрид HD ▾  ";
+                case 3: return @"  OSM ▾  ";
+                default: return @"  Улицы HD ▾  ";
+              }
+            }
+            switch (self.styleIndex % 3) {
+              case 1: return @"  Спутник ▾  ";
+              case 2: return @"  Схема ▾  ";
+              default: return @"  Карта ▾  ";
+            }
+          }
+
+          - (BOOL)isDarkMapStyle {
+            if ([self hasMapTiler]) {
+              NSInteger s = self.styleIndex % 4;
+              return (s == 1 || s == 2);
+            }
+            return ((self.styleIndex % 3) == 1);
+          }
+
+          - (void)updateBackgroundTone {
+            self.backgroundColor = [self isDarkMapStyle]
+              ? [UIColor colorWithRed:0.11 green:0.13 blue:0.16 alpha:1.0]
+              : [UIColor colorWithRed:0.86 green:0.89 blue:0.92 alpha:1.0];
+          }
+
+          - (CGPoint)crosshairPoint {
+            // Center horizontally, slightly above midpoint vertically to feel balanced above bottom sheet
+            return CGPointMake(self.bounds.size.width * 0.5, self.bounds.size.height * 0.45);
+          }
+
+          - (void)setPinLifted:(BOOL)lifted {
+            if (_pinLifted == lifted) return;
+            _pinLifted = lifted;
+            [UIView animateWithDuration:0.16 delay:0 options:(UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction) animations:^{
+              CGPoint cp = [self crosshairPoint];
+              self.pinView.center = CGPointMake(cp.x, cp.y - (lifted ? 29.0 : 19.0));
+              self.pinView.transform = lifted ? CGAffineTransformMakeScale(1.08, 1.08) : CGAffineTransformIdentity;
+              self.pinView.layer.shadowRadius = lifted ? 8.0 : 4.0;
+              self.pinView.layer.shadowOpacity = lifted ? 0.32 : 0.45;
+              self.targetGroundDot.transform = lifted ? CGAffineTransformMakeScale(1.25, 1.25) : CGAffineTransformIdentity;
+            } completion:nil];
           }
 
           - (void)willMoveToSuperview:(UIView *)newSuperview {
@@ -2055,6 +2176,19 @@ jobs:
             [self.displayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
           }
 
+          - (void)emitCenterChanged {
+            if (self.onCenterChanged) {
+              self.onCenterChanged(CLLocationCoordinate2DMake(self.centerLat, self.centerLon));
+            }
+          }
+
+          - (void)emitCenterSettled {
+            [self setPinLifted:NO];
+            if (self.onCenterSettled) {
+              self.onCenterSettled(CLLocationCoordinate2DMake(self.centerLat, self.centerLon));
+            }
+          }
+
           - (void)onDisplayLink:(CADisplayLink *)link {
             CFTimeInterval now = link.timestamp;
             if (self.animMode == 1) {
@@ -2073,8 +2207,10 @@ jobs:
               self.panVelX *= decay;
               self.panVelY *= decay;
               [self reloadTiles];
+              [self emitCenterChanged];
               if (hypot(self.panVelX, self.panVelY) < 18.0) {
                 [self stopAnimations];
+                [self emitCenterSettled];
               }
             } else if (self.animMode == 2) {
               if (self.zoomStartTs <= 0.0) self.zoomStartTs = now;
@@ -2082,17 +2218,39 @@ jobs:
               double ease = 1.0 - pow(1.0 - t, 3.0);
               double newZ = self.zoomStart + (self.zoomTarget - self.zoomStart) * ease;
               double w = gsWorldSize(newZ);
+              CGPoint cp = [self crosshairPoint];
               double ax = gsLonToX(self.zoomAnchorLon, newZ);
               double ay = gsLatToY(self.zoomAnchorLat, newZ);
-              double cx = fmod(ax - (self.zoomAnchorPt.x - self.bounds.size.width * 0.5), w);
+              double cx = fmod(ax - (self.zoomAnchorPt.x - cp.x), w);
               if (cx < 0) cx += w;
-              double cy = fmax(0.0, fmin(w, ay - (self.zoomAnchorPt.y - self.bounds.size.height * 0.5)));
+              double cy = fmax(0.0, fmin(w, ay - (self.zoomAnchorPt.y - cp.y)));
               self.zoom = newZ;
               self.centerLon = gsXToLon(cx, newZ);
               self.centerLat = gsYToLat(cy, newZ);
               [self reloadTiles];
+              [self emitCenterChanged];
               if (t >= 1.0) {
                 [self stopAnimations];
+                [self emitCenterSettled];
+              }
+            } else if (self.animMode == 3) {
+              if (self.glideStartTs <= 0.0) self.glideStartTs = now;
+              double t = fmax(0.0, fmin(1.0, (now - self.glideStartTs) / fmax(0.05, self.glideDuration)));
+              double ease = 1.0 - pow(1.0 - t, 3.0);
+              double w = gsWorldSize(self.zoom);
+              double dx = self.glideTargetX - self.glideStartX;
+              if (dx > w * 0.5) dx -= w;
+              if (dx < -w * 0.5) dx += w;
+              double cx = fmod(self.glideStartX + dx * ease, w);
+              if (cx < 0) cx += w;
+              double cy = fmax(0.0, fmin(w, self.glideStartY + (self.glideTargetY - self.glideStartY) * ease));
+              self.centerLon = gsXToLon(cx, self.zoom);
+              self.centerLat = gsYToLat(cy, self.zoom);
+              [self reloadTiles];
+              [self emitCenterChanged];
+              if (t >= 1.0) {
+                [self stopAnimations];
+                [self emitCenterSettled];
               }
             } else {
               [self stopAnimations];
@@ -2115,9 +2273,11 @@ jobs:
             for (UIImageView *iv in self.visibleTiles.allValues) [iv removeFromSuperview];
             [self.visibleTiles removeAllObjects];
             [self.viewCacheKeys removeAllObjects];
+            [self updateBackgroundTone];
           }
 
           - (CGPoint)screenPointForLat:(double)lat lon:(double)lon {
+            CGPoint cp = [self crosshairPoint];
             double cx = gsLonToX(self.centerLon, self.zoom);
             double cy = gsLatToY(self.centerLat, self.zoom);
             double px = gsLonToX(lon, self.zoom);
@@ -2126,23 +2286,53 @@ jobs:
             double dx = px - cx;
             if (dx > w * 0.5) dx -= w;
             if (dx < -w * 0.5) dx += w;
-            return CGPointMake(self.bounds.size.width * 0.5 + dx, self.bounds.size.height * 0.5 + (py - cy));
+            return CGPointMake(cp.x + dx, cp.y + (py - cy));
           }
 
           - (CLLocationCoordinate2D)coordForScreenPoint:(CGPoint)pt {
+            CGPoint cp = [self crosshairPoint];
             double cx = gsLonToX(self.centerLon, self.zoom);
             double cy = gsLatToY(self.centerLat, self.zoom);
             double w = gsWorldSize(self.zoom);
-            double wx = fmod(cx + (pt.x - self.bounds.size.width * 0.5), w);
+            double wx = fmod(cx + (pt.x - cp.x), w);
             if (wx < 0) wx += w;
-            double wy = fmax(0.0, fmin(w, cy + (pt.y - self.bounds.size.height * 0.5)));
+            double wy = fmax(0.0, fmin(w, cy + (pt.y - cp.y)));
             return CLLocationCoordinate2DMake(gsYToLat(wy, self.zoom), gsXToLon(wx, self.zoom));
           }
 
+          - (NSString *)providerTagForStyle:(NSInteger)style {
+            if ([self hasMapTiler]) {
+              return [NSString stringWithFormat:@"mt%ld", (long)(style % 4)];
+            }
+            return [NSString stringWithFormat:@"fr%ld", (long)(style % 3)];
+          }
+
+          - (int)maxZoomForStyle:(NSInteger)style {
+            if ([self hasMapTiler]) {
+              NSInteger s = style % 4;
+              return (s == 2) ? 18 : 19;
+            }
+            return ((style % 3) == 0) ? 19 : 18;
+          }
+
           - (NSURL *)tileURLForStyle:(NSInteger)style z:(int)z x:(int)x y:(int)y {
-            if (style == 1) {
+            if ([self hasMapTiler]) {
+              NSString *key = gsEncodeQueryValue(self.mapTilerKey);
+              switch (style % 4) {
+                case 0:
+                  return [NSURL URLWithString:[NSString stringWithFormat:@"https://api.maptiler.com/maps/streets-v2/256/%d/%d/%d@2x.png?key=%@", z, x, y, key]];
+                case 1:
+                  return [NSURL URLWithString:[NSString stringWithFormat:@"https://api.maptiler.com/maps/streets-v2-dark/256/%d/%d/%d@2x.png?key=%@", z, x, y, key]];
+                case 2:
+                  return [NSURL URLWithString:[NSString stringWithFormat:@"https://api.maptiler.com/maps/hybrid/256/%d/%d/%d@2x.jpg?key=%@", z, x, y, key]];
+                default:
+                  return [NSURL URLWithString:[NSString stringWithFormat:@"https://tile.openstreetmap.org/%d/%d/%d.png", z, x, y]];
+              }
+            }
+            NSInteger s = style % 3;
+            if (s == 1) {
               return [NSURL URLWithString:[NSString stringWithFormat:@"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/%d/%d/%d", z, y, x]];
-            } else if (style == 2) {
+            } else if (s == 2) {
               return [NSURL URLWithString:[NSString stringWithFormat:@"https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/%d/%d/%d", z, y, x]];
             } else {
               return [NSURL URLWithString:[NSString stringWithFormat:@"https://tile.openstreetmap.org/%d/%d/%d.png", z, x, y]];
@@ -2150,9 +2340,28 @@ jobs:
           }
 
           - (void)updateMarkers {
-            CGPoint pp = [self screenPointForLat:self.pinCoord.latitude lon:self.pinCoord.longitude];
-            self.pinView.center = CGPointMake(pp.x, pp.y - 16.0);
-            self.pinView.tintColor = self.spoofActive ? UIColor.systemGreenColor : UIColor.systemRedColor;
+            CGPoint cp = [self crosshairPoint];
+            self.targetGroundDot.center = cp;
+            self.pinView.center = CGPointMake(cp.x, cp.y - (self.pinLifted ? 29.0 : 19.0));
+
+            BOOL aimedAtActive = NO;
+            if (self.spoofActive && self.hasActiveSpoofCoord) {
+              CGPoint ap = [self screenPointForLat:self.activeSpoofCoord.latitude lon:self.activeSpoofCoord.longitude];
+              double distPx = hypot(ap.x - cp.x, ap.y - cp.y);
+              aimedAtActive = (distPx < 16.0);
+              self.activeDotView.center = ap;
+              self.activeDotView.hidden = aimedAtActive;
+            } else {
+              self.activeDotView.hidden = YES;
+            }
+
+            if (self.spoofActive && (!self.hasActiveSpoofCoord || aimedAtActive)) {
+              self.pinView.tintColor = UIColor.systemGreenColor;
+            } else if (self.spoofActive) {
+              self.pinView.tintColor = UIColor.systemBlueColor;
+            } else {
+              self.pinView.tintColor = UIColor.systemRedColor;
+            }
 
             if (self.hasRealCoord) {
               CGPoint rp = [self screenPointForLat:self.realCoord.latitude lon:self.realCoord.longitude];
@@ -2167,7 +2376,7 @@ jobs:
             CGSize sz = self.bounds.size;
             if (sz.width < 10 || sz.height < 10) return;
 
-            int maxZ = (self.styleIndex == 0) ? 19 : 18;
+            int maxZ = [self maxZoomForStyle:self.styleIndex];
             int tz = (int)floor(self.zoom);
             if (tz < 2) tz = 2;
             if (tz > maxZ) tz = maxZ;
@@ -2175,15 +2384,21 @@ jobs:
 
             double scale = pow(2.0, self.zoom - tz);
             double tilePx = 256.0 * scale;
+            CGPoint cp = [self crosshairPoint];
             double cx = gsLonToX(self.centerLon, self.zoom);
             double cy = gsLatToY(self.centerLat, self.zoom);
-            double leftWorld = cx - sz.width * 0.5;
-            double topWorld  = cy - sz.height * 0.5;
+            double leftWorld = cx - cp.x;
+            double topWorld  = cy - cp.y;
 
             int tx0 = (int)floor(leftWorld / tilePx) - 1;
             int tx1 = (int)floor((leftWorld + sz.width) / tilePx) + 1;
             int ty0 = (int)floor(topWorld / tilePx) - 1;
             int ty1 = (int)floor((topWorld + sz.height) / tilePx) + 1;
+
+            NSString *ptag = [self providerTagForStyle:self.styleIndex];
+            UIColor *tileBg = [self isDarkMapStyle]
+              ? [UIColor colorWithRed:0.11 green:0.13 blue:0.16 alpha:1.0]
+              : [UIColor colorWithRed:0.86 green:0.89 blue:0.92 alpha:1.0];
 
             NSMutableSet<NSString *> *neededViews = [NSMutableSet set];
             NSMutableSet<NSString *> *neededCaches = [NSMutableSet set];
@@ -2192,8 +2407,8 @@ jobs:
               if (ty < 0 || ty >= n) continue;
               for (int tx = tx0; tx <= tx1; tx++) {
                 int wx = ((tx % n) + n) % n;
-                NSString *viewKey = [NSString stringWithFormat:@"%ld:%d:%d:%d", (long)self.styleIndex, tz, tx, ty];
-                NSString *cacheKey = [NSString stringWithFormat:@"%ld:%d:%d:%d", (long)self.styleIndex, tz, wx, ty];
+                NSString *viewKey = [NSString stringWithFormat:@"%@:%d:%d:%d", ptag, tz, tx, ty];
+                NSString *cacheKey = [NSString stringWithFormat:@"%@:%d:%d:%d", ptag, tz, wx, ty];
                 [neededViews addObject:viewKey];
                 [neededCaches addObject:cacheKey];
 
@@ -2207,13 +2422,13 @@ jobs:
                 if (!iv) {
                   iv = [[UIImageView alloc] initWithFrame:frame];
                   iv.contentMode = UIViewContentModeScaleToFill;
-                  iv.backgroundColor = [UIColor colorWithRed:0.86 green:0.89 blue:0.92 alpha:1.0];
+                  iv.backgroundColor = tileBg;
                   if (cached) {
                     iv.layer.contentsRect = CGRectMake(0, 0, 1, 1);
                     iv.image = cached;
                   } else {
                     if (tz > 2) {
-                      NSString *pkey = [NSString stringWithFormat:@"%ld:%d:%d:%d", (long)self.styleIndex, tz - 1, wx >> 1, ty >> 1];
+                      NSString *pkey = [NSString stringWithFormat:@"%@:%d:%d:%d", ptag, tz - 1, wx >> 1, ty >> 1];
                       UIImage *pimg = [self.tileCache objectForKey:pkey];
                       if (pimg) {
                         iv.layer.contentsRect = CGRectMake((wx & 1) ? 0.5 : 0.0, (ty & 1) ? 0.5 : 0.0, 0.5, 0.5);
@@ -2257,7 +2472,7 @@ jobs:
               int cty = (int)floor(cy / tilePx);
               if (cty >= 0 && cty < n) {
                 int ptx = ctx >> 1, pty = cty >> 1;
-                NSString *pkey = [NSString stringWithFormat:@"%ld:%d:%d:%d", (long)self.styleIndex, tz - 1, ptx, pty];
+                NSString *pkey = [NSString stringWithFormat:@"%@:%d:%d:%d", ptag, tz - 1, ptx, pty];
                 if (![self.tileCache objectForKey:pkey] && !self.inFlightTasks[pkey]) {
                   [self fetchTileKey:pkey style:self.styleIndex z:tz - 1 x:ptx y:pty isFallback:NO silent:YES];
                 }
@@ -2289,8 +2504,13 @@ jobs:
 
           - (void)fetchTileKey:(NSString *)cacheKey style:(NSInteger)style z:(int)z x:(int)x y:(int)y isFallback:(BOOL)isFallback silent:(BOOL)silent {
             if (!isFallback && self.inFlightTasks[cacheKey]) return;
-            NSURL *url = [self tileURLForStyle:style z:z x:x y:y];
+            NSURL *url = isFallback
+              ? [NSURL URLWithString:[NSString stringWithFormat:@"https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/%d/%d/%d", z, y, x]]
+              : [self tileURLForStyle:style z:z x:x y:y];
             if (!url) return;
+
+            BOOL isMT = [self hasMapTiler] && ((style % 4) != 3) && !isFallback;
+            BOOL canOsmFallback = (![self hasMapTiler] && (style % 3) == 0 && z <= 18);
 
             __weak typeof(self) weakSelf = self;
             __block NSUInteger tid = 0;
@@ -2316,16 +2536,23 @@ jobs:
                   if (isCurrent) [self.inFlightTasks removeObjectForKey:cacheKey];
                   [self.tileCache setObject:img forKey:cacheKey];
                   if (!silent && self.onTileError) self.onTileError(nil);
-                  // Always apply loaded image (user may have zoomed onto a silent-prefetched tile)
                   [self applyLoadedImage:img forCacheKey:cacheKey];
-                } else if (!isFallback && style == 0 && z <= 18 && self.styleIndex == style) {
+                } else if (!isFallback && canOsmFallback && self.styleIndex == style) {
                   if (isCurrent) [self.inFlightTasks removeObjectForKey:cacheKey];
-                  [self fetchTileKey:cacheKey style:2 z:z x:x y:y isFallback:YES silent:silent];
+                  [self fetchTileKey:cacheKey style:style z:z x:x y:y isFallback:YES silent:silent];
                 } else {
                   if (isCurrent) [self.inFlightTasks removeObjectForKey:cacheKey];
-                  if (!silent && self.onTileError) {
-                    NSString *m = err ? [NSString stringWithFormat:@"Нет сети (%ld)", (long)err.code]
-                              : [NSString stringWithFormat:@"Тайл HTTP %ld", (long)httpCode];
+                  CFTimeInterval now = CACurrentMediaTime();
+                  if (!silent && self.onTileError && (now - self.lastTileErrToastTs) > 3.0) {
+                    self.lastTileErrToastTs = now;
+                    NSString *m = nil;
+                    if (isMT && (httpCode == 401 || httpCode == 403 || httpCode == 429)) {
+                      m = [NSString stringWithFormat:@"MapTiler HTTP %ld — проверь ключ в ⚙", (long)httpCode];
+                    } else if (err) {
+                      m = [NSString stringWithFormat:@"Нет сети (%ld)", (long)err.code];
+                    } else {
+                      m = [NSString stringWithFormat:@"Тайл HTTP %ld", (long)httpCode];
+                    }
                     self.onTileError(m);
                   }
                 }
@@ -2350,10 +2577,23 @@ jobs:
             [self ensureDisplayLink];
           }
 
+          - (void)glideToCoord:(CLLocationCoordinate2D)coord duration:(CFTimeInterval)dur {
+            if (!CLLocationCoordinate2DIsValid(coord)) return;
+            [self stopAnimations];
+            self.glideStartX = gsLonToX(self.centerLon, self.zoom);
+            self.glideStartY = gsLatToY(self.centerLat, self.zoom);
+            self.glideTargetX = gsLonToX(coord.longitude, self.zoom);
+            self.glideTargetY = gsLatToY(coord.latitude, self.zoom);
+            self.glideStartTs = 0.0;
+            self.glideDuration = dur;
+            self.animMode = 3;
+            [self setPinLifted:YES];
+            [self ensureDisplayLink];
+          }
+
           - (void)zoomBy:(double)delta {
             double baseZ = (self.animMode == 2) ? self.zoomTarget : self.zoom;
-            CGPoint centerPt = CGPointMake(self.bounds.size.width * 0.5, self.bounds.size.height * 0.5);
-            [self animateZoomTo:baseZ + delta anchorPoint:centerPt duration:0.20];
+            [self animateZoomTo:baseZ + delta anchorPoint:[self crosshairPoint] duration:0.20];
           }
 
           - (BOOL)isPinchBlockingPan {
@@ -2369,6 +2609,7 @@ jobs:
             }
             if (gr.state == UIGestureRecognizerStateBegan) {
               [self stopAnimations];
+              [self setPinLifted:YES];
               if (self.onInteraction) self.onInteraction();
             } else if (gr.state == UIGestureRecognizerStateChanged) {
               CGPoint tr = [gr translationInView:self];
@@ -2380,6 +2621,7 @@ jobs:
               self.centerLon = gsXToLon(cx, self.zoom);
               self.centerLat = gsYToLat(cy, self.zoom);
               [self reloadTiles];
+              [self emitCenterChanged];
             } else if (gr.state == UIGestureRecognizerStateEnded) {
               CGPoint vel = [gr velocityInView:self];
               double spd = hypot(vel.x, vel.y);
@@ -2390,7 +2632,11 @@ jobs:
                 self.panVelY = vel.y * k;
                 self.animMode = 1;
                 [self ensureDisplayLink];
+              } else {
+                [self emitCenterSettled];
               }
+            } else if (gr.state == UIGestureRecognizerStateCancelled || gr.state == UIGestureRecognizerStateFailed) {
+              if (self.animMode == 0) [self emitCenterSettled];
             }
           }
 
@@ -2398,6 +2644,7 @@ jobs:
             if (gr.state == UIGestureRecognizerStateBegan) {
               if (gr.numberOfTouches < 2) return;
               [self stopAnimations];
+              [self setPinLifted:YES];
               if (self.onInteraction) self.onInteraction();
               self.pinchNeedsReanchor = NO;
               self.pinchStartZoom = self.zoom;
@@ -2421,22 +2668,25 @@ jobs:
                 gr.scale = 1.0;
                 return;
               }
+              CGPoint cp = [self crosshairPoint];
               double newZ = fmax(2.0, fmin(19.0, self.pinchStartZoom + log2(fmax(0.1, gr.scale))));
               double w = gsWorldSize(newZ);
               double ax = gsLonToX(self.pinchAnchorLon, newZ);
               double ay = gsLatToY(self.pinchAnchorLat, newZ);
-              double cx = fmod(ax - (loc.x - self.bounds.size.width * 0.5), w);
+              double cx = fmod(ax - (loc.x - cp.x), w);
               if (cx < 0) cx += w;
-              double cy = fmax(0.0, fmin(w, ay - (loc.y - self.bounds.size.height * 0.5)));
+              double cy = fmax(0.0, fmin(w, ay - (loc.y - cp.y)));
               self.zoom = newZ;
               self.centerLon = gsXToLon(cx, newZ);
               self.centerLat = gsYToLat(cy, newZ);
               [self reloadTiles];
+              [self emitCenterChanged];
             } else if (gr.state == UIGestureRecognizerStateEnded ||
                    gr.state == UIGestureRecognizerStateCancelled ||
                    gr.state == UIGestureRecognizerStateFailed) {
               self.pinchNeedsReanchor = NO;
               self.pinchEndedTs = CACurrentMediaTime();
+              [self emitCenterSettled];
             }
           }
 
@@ -2455,14 +2705,11 @@ jobs:
           }
 
           - (void)handleTap:(UITapGestureRecognizer *)gr {
-            [self stopAnimations];
             if (self.onInteraction) self.onInteraction();
             CGPoint pt = [gr locationInView:self];
             CLLocationCoordinate2D c = [self coordForScreenPoint:pt];
             if (CLLocationCoordinate2DIsValid(c)) {
-              self.pinCoord = c;
-              [self updateMarkers];
-              if (self.onPinChanged) self.onPinChanged(c);
+              [self glideToCoord:c duration:0.22];
             }
           }
 
@@ -2473,6 +2720,7 @@ jobs:
           @property (nonatomic, copy) void (^onPick)(double lat, double lon);
           @property (nonatomic, copy) void (^onFavoritesChanged)(void);
           @property (nonatomic, assign) CLLocationCoordinate2D currentCoord;
+          @property (nonatomic, copy) NSString *suggestedName;
           @property (nonatomic, strong) NSMutableArray<NSDictionary *> *items;
           @end
 
@@ -2500,6 +2748,7 @@ jobs:
                                        preferredStyle:UIAlertControllerStyleAlert];
             [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
               tf.placeholder = @"Название (например, Дом / Офис)";
+              if (self.suggestedName.length) tf.text = self.suggestedName;
               tf.autocapitalizationType = UITextAutocapitalizationTypeSentences;
             }];
             [ac addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
@@ -2569,18 +2818,25 @@ jobs:
           @property (nonatomic, strong) NSArray<NSDictionary *> *searchResults;
           @property (nonatomic, strong) NSURLSessionDataTask *searchTask;
           @property (nonatomic, assign) NSUInteger searchGeneration;
+          @property (nonatomic, strong) NSURLSessionDataTask *reverseTask;
+          @property (nonatomic, assign) NSUInteger reverseGeneration;
+          @property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *reverseCache;
+          @property (nonatomic, copy) NSString *currentAddress;
           @property (nonatomic, strong) UILabel *toastLabel;
           @property (nonatomic, strong) UIButton *styleBadge;
 
           @property (nonatomic, strong) UIView *bottomCard;
-          @property (nonatomic, strong) UIScrollView *quickBarScroll;
+          @property (nonatomic, strong) UIStackView *optsRow;
+          @property (nonatomic, assign) BOOL sheetExpanded;
+          @property (nonatomic, strong) GSChipScrollView *quickBarScroll;
           @property (nonatomic, strong) UIStackView *quickBarStack;
           @property (nonatomic, strong) NSArray<NSDictionary *> *quickFavorites;
 
           @property (nonatomic, strong) UIView *statusDot;
           @property (nonatomic, strong) UILabel *statusLabel;
           @property (nonatomic, strong) UIButton *realButton;
-          @property (nonatomic, strong) UILabel *coordLabel;
+          @property (nonatomic, strong) UILabel *addressLabel;
+          @property (nonatomic, strong) UILabel *coordSubLabel;
           @property (nonatomic, strong) UISegmentedControl *jitterControl;
           @property (nonatomic, strong) UIButton *altButton;
           @property (nonatomic, strong) UIButton *startButton;
@@ -2607,6 +2863,7 @@ jobs:
             [super viewDidLoad];
             self.view.backgroundColor = UIColor.systemBackgroundColor;
             self.cliQueue = dispatch_queue_create("xyz.regulad.geoshim.cli", DISPATCH_QUEUE_SERIAL);
+            self.reverseCache = [NSMutableDictionary dictionary];
 
             NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
             self.cliJitterCap = [ud integerForKey:kJitterCapKey];
@@ -2620,7 +2877,8 @@ jobs:
 
             BOOL act = NO;
             CLLocationCoordinate2D tc;
-            if (gsReadTargetNotify(&act, &tc) && act) {
+            BOOL hasTarget = gsReadTargetNotify(&act, &tc);
+            if (hasTarget && act) {
               self.selectedCoord = tc;
               self.cliKnownActive = YES;
             } else if ([ud objectForKey:kLastLatKey] && [ud objectForKey:kLastLonKey]) {
@@ -2638,7 +2896,12 @@ jobs:
             [self.view bringSubviewToFront:self.resultsTable];
             [self.view bringSubviewToFront:self.toastLabel];
 
-            [self movePinTo:self.selectedCoord centerMap:YES zoom:15.0];
+            if (hasTarget && act) {
+              self.mapView.activeSpoofCoord = tc;
+              self.mapView.hasActiveSpoofCoord = YES;
+            }
+
+            [self moveCrosshairTo:self.selectedCoord zoom:15.5 preserveAddress:NO];
             [self reloadQuickFavoritesBar];
             [self refreshStatus];
             [self syncInitialCLIStatus];
@@ -2692,8 +2955,12 @@ jobs:
                 if (!self) return;
                 if (rc == 0 && out.length) {
                   self.cliKnownActive = en;
-                  if (en && hasCoord && !self.userInteracted) {
-                    [self movePinTo:parsedCoord centerMap:YES zoom:15.0];
+                  if (en && hasCoord) {
+                    self.mapView.activeSpoofCoord = parsedCoord;
+                    self.mapView.hasActiveSpoofCoord = YES;
+                    if (!self.userInteracted) {
+                      [self moveCrosshairTo:parsedCoord zoom:15.5 preserveAddress:NO];
+                    }
                   }
                   [self refreshStatus];
                 }
@@ -2707,7 +2974,7 @@ jobs:
             self.toastLabel.hidden = NO;
             self.toastLabel.alpha = 1.0;
             [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(hideToast) object:nil];
-            [self performSelector:@selector(hideToast) withObject:nil afterDelay:2.6];
+            [self performSelector:@selector(hideToast) withObject:nil afterDelay:2.8];
           }
 
           - (void)hideToast {
@@ -2720,16 +2987,32 @@ jobs:
           }
 
           - (void)setupMap {
+            NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
             self.mapView = [[GSTileMapView alloc] initWithFrame:self.view.bounds];
             self.mapView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-            self.mapView.styleIndex = [NSUserDefaults.standardUserDefaults integerForKey:kMapStyleKey] % 3;
+            self.mapView.mapTilerKey = gsStr([ud stringForKey:kMapTilerKey]) ?: @"";
+            self.mapView.styleIndex = [ud integerForKey:kMapStyleKey] % [self.mapView styleCount];
+            [self.mapView clearVisibleTiles];
+
             __weak typeof(self) weakSelf = self;
-            self.mapView.onPinChanged = ^(CLLocationCoordinate2D c) {
-              [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight] impactOccurred];
+            self.mapView.onCenterChanged = ^(CLLocationCoordinate2D c) {
               weakSelf.userInteracted = YES;
               weakSelf.selectedCoord = c;
-              weakSelf.coordLabel.text = [NSString stringWithFormat:@"%.6f, %.6f", c.latitude, c.longitude];
+              if (weakSelf.reverseTask) {
+                [weakSelf.reverseTask cancel];
+                weakSelf.reverseTask = nil;
+              }
+              weakSelf.reverseGeneration++;
+              if (weakSelf.currentAddress.length) weakSelf.currentAddress = @"";
+              [weakSelf updateCoordDisplay];
               [weakSelf updateQuickBarHighlights];
+            };
+            self.mapView.onCenterSettled = ^(CLLocationCoordinate2D c) {
+              weakSelf.userInteracted = YES;
+              weakSelf.selectedCoord = c;
+              [weakSelf updateCoordDisplay];
+              [weakSelf updateQuickBarHighlights];
+              [weakSelf scheduleReverseGeocodeForCoord:c];
             };
             self.mapView.onInteraction = ^{
               weakSelf.userInteracted = YES;
@@ -2811,63 +3094,75 @@ jobs:
           - (UIButton *)makeMapToolButton:(NSString *)symbol action:(SEL)action {
             UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
             b.translatesAutoresizingMaskIntoConstraints = NO;
-            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:18 weight:UIImageSymbolWeightSemibold];
+            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:17 weight:UIImageSymbolWeightSemibold];
             [b setImage:[UIImage systemImageNamed:symbol withConfiguration:cfg] forState:UIControlStateNormal];
             b.backgroundColor = [UIColor.systemBackgroundColor colorWithAlphaComponent:0.93];
             b.tintColor = UIColor.labelColor;
-            b.layer.cornerRadius = 22;
+            b.layer.cornerRadius = 21;
             b.layer.shadowColor = UIColor.blackColor.CGColor;
             b.layer.shadowOpacity = 0.22;
             b.layer.shadowRadius = 6;
             b.layer.shadowOffset = CGSizeMake(0, 2);
             [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
             [NSLayoutConstraint activateConstraints:@[
-              [b.widthAnchor constraintEqualToConstant:44],
-              [b.heightAnchor constraintEqualToConstant:44]
+              [b.widthAnchor constraintEqualToConstant:42],
+              [b.heightAnchor constraintEqualToConstant:42]
             ]];
             return b;
-          }
-
-          - (NSString *)styleTitle:(NSInteger)idx {
-            if (idx == 1) return @"Спутник ▾";
-            if (idx == 2) return @"Схема ▾";
-            return @"Карта ▾";
           }
 
           - (void)setupSideButtons {
             self.styleBadge = [UIButton buttonWithType:UIButtonTypeSystem];
             self.styleBadge.translatesAutoresizingMaskIntoConstraints = NO;
             self.styleBadge.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightBold];
-            [self.styleBadge setTitle:[self styleTitle:self.mapView.styleIndex] forState:UIControlStateNormal];
+            [self.styleBadge setTitle:[self.mapView currentStyleTitle] forState:UIControlStateNormal];
             self.styleBadge.backgroundColor = [UIColor.systemBackgroundColor colorWithAlphaComponent:0.93];
             [self.styleBadge setTitleColor:UIColor.labelColor forState:UIControlStateNormal];
-            self.styleBadge.layer.cornerRadius = 14;
+            self.styleBadge.layer.cornerRadius = 15;
             self.styleBadge.layer.shadowColor = UIColor.blackColor.CGColor;
             self.styleBadge.layer.shadowOpacity = 0.18;
             self.styleBadge.layer.shadowRadius = 4;
             [self.styleBadge addTarget:self action:@selector(cycleMapType) forControlEvents:UIControlEventTouchUpInside];
             [self.view addSubview:self.styleBadge];
 
+            UIButton *hdGearBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+            hdGearBtn.translatesAutoresizingMaskIntoConstraints = NO;
+            UIImageSymbolConfiguration *gcfg = [UIImageSymbolConfiguration configurationWithPointSize:13 weight:UIImageSymbolWeightSemibold];
+            [hdGearBtn setImage:[UIImage systemImageNamed:@"gearshape.fill" withConfiguration:gcfg] forState:UIControlStateNormal];
+            hdGearBtn.backgroundColor = [UIColor.systemBackgroundColor colorWithAlphaComponent:0.93];
+            hdGearBtn.tintColor = UIColor.labelColor;
+            hdGearBtn.layer.cornerRadius = 15;
+            hdGearBtn.layer.shadowColor = UIColor.blackColor.CGColor;
+            hdGearBtn.layer.shadowOpacity = 0.18;
+            hdGearBtn.layer.shadowRadius = 4;
+            [hdGearBtn addTarget:self action:@selector(openMapSettings) forControlEvents:UIControlEventTouchUpInside];
+            [self.view addSubview:hdGearBtn];
+
             UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
               [self makeMapToolButton:@"star.fill" action:@selector(openFavorites)],
               [self makeMapToolButton:@"doc.on.clipboard" action:@selector(pasteOrManualInput)],
-              [self makeMapToolButton:@"scope" action:@selector(centerOnPin)],
+              [self makeMapToolButton:@"scope" action:@selector(centerOnActiveOrReal)],
               [self makeMapToolButton:@"plus" action:@selector(zoomInTapped)],
               [self makeMapToolButton:@"minus" action:@selector(zoomOutTapped)]
             ]];
             stack.axis = UILayoutConstraintAxisVertical;
-            stack.spacing = 9;
+            stack.spacing = 8;
             stack.translatesAutoresizingMaskIntoConstraints = NO;
             [self.view addSubview:stack];
 
             UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
             [NSLayoutConstraint activateConstraints:@[
-              [self.styleBadge.topAnchor constraintEqualToAnchor:safe.topAnchor constant:66],
+              [self.styleBadge.topAnchor constraintEqualToAnchor:safe.topAnchor constant:64],
               [self.styleBadge.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
-              [self.styleBadge.widthAnchor constraintGreaterThanOrEqualToConstant:88],
+              [self.styleBadge.widthAnchor constraintGreaterThanOrEqualToConstant:96],
               [self.styleBadge.heightAnchor constraintEqualToConstant:30],
 
-              [stack.topAnchor constraintEqualToAnchor:safe.topAnchor constant:66],
+              [hdGearBtn.centerYAnchor constraintEqualToAnchor:self.styleBadge.centerYAnchor],
+              [hdGearBtn.leadingAnchor constraintEqualToAnchor:self.styleBadge.trailingAnchor constant:8],
+              [hdGearBtn.widthAnchor constraintEqualToConstant:30],
+              [hdGearBtn.heightAnchor constraintEqualToConstant:30],
+
+              [stack.topAnchor constraintEqualToAnchor:safe.topAnchor constant:64],
               [stack.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12]
             ]];
           }
@@ -2878,11 +3173,38 @@ jobs:
             card.backgroundColor = [UIColor.secondarySystemBackgroundColor colorWithAlphaComponent:0.96];
             card.layer.cornerRadius = 22;
             card.layer.shadowColor = UIColor.blackColor.CGColor;
-            card.layer.shadowOpacity = 0.24;
+            card.layer.shadowOpacity = 0.25;
             card.layer.shadowRadius = 12;
             card.layer.shadowOffset = CGSizeMake(0, 4);
             [self.view addSubview:card];
             self.bottomCard = card;
+
+            // Swipe up/down on card to expand or collapse jitter/altitude options
+            UISwipeGestureRecognizer *swipeUp = [[UISwipeGestureRecognizer alloc] initWithTarget:self action:@selector(expandSheet)];
+            swipeUp.direction = UISwipeGestureRecognizerDirectionUp;
+            [card addGestureRecognizer:swipeUp];
+
+            UISwipeGestureRecognizer *swipeDown = [[UISwipeGestureRecognizer alloc] initWithTarget:self action:@selector(collapseSheet)];
+            swipeDown.direction = UISwipeGestureRecognizerDirectionDown;
+            [card addGestureRecognizer:swipeDown];
+
+            // Top grabber button (tap toggles compact <-> expanded)
+            UIButton *grabberBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+            grabberBtn.translatesAutoresizingMaskIntoConstraints = NO;
+            UIView *pill = [[UIView alloc] init];
+            pill.translatesAutoresizingMaskIntoConstraints = NO;
+            pill.backgroundColor = [UIColor.tertiaryLabelColor colorWithAlphaComponent:0.65];
+            pill.layer.cornerRadius = 2.0;
+            pill.userInteractionEnabled = NO;
+            [grabberBtn addSubview:pill];
+            [grabberBtn addTarget:self action:@selector(toggleSheet) forControlEvents:UIControlEventTouchUpInside];
+            [NSLayoutConstraint activateConstraints:@[
+              [grabberBtn.heightAnchor constraintEqualToConstant:14],
+              [pill.centerXAnchor constraintEqualToAnchor:grabberBtn.centerXAnchor],
+              [pill.centerYAnchor constraintEqualToAnchor:grabberBtn.centerYAnchor],
+              [pill.widthAnchor constraintEqualToConstant:38],
+              [pill.heightAnchor constraintEqualToConstant:4]
+            ]];
 
             self.statusDot = [[UIView alloc] init];
             self.statusDot.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2890,7 +3212,7 @@ jobs:
             self.statusDot.backgroundColor = UIColor.systemGrayColor;
 
             self.statusLabel = [[UILabel alloc] init];
-            self.statusLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightBold];
+            self.statusLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightBold];
             self.statusLabel.text = @"ПРОВЕРКА...";
 
             self.realButton = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -2904,25 +3226,42 @@ jobs:
             statusRow.alignment = UIStackViewAlignmentCenter;
             statusRow.spacing = 6;
             [NSLayoutConstraint activateConstraints:@[
-              [self.statusDot.widthAnchor constraintEqualToConstant:10],
-              [self.statusDot.heightAnchor constraintEqualToConstant:10]
+              [self.statusDot.widthAnchor constraintEqualToConstant:9],
+              [self.statusDot.heightAnchor constraintEqualToConstant:9]
             ]];
 
-            self.coordLabel = [[UILabel alloc] init];
-            self.coordLabel.font = [UIFont monospacedDigitSystemFontOfSize:17 weight:UIFontWeightSemibold];
-            self.coordLabel.textColor = UIColor.labelColor;
+            // Address + compact coordinate/params subtitle + quick bookmark icon
+            self.addressLabel = [[UILabel alloc] init];
+            self.addressLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+            self.addressLabel.textColor = UIColor.labelColor;
+            self.addressLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+
+            self.coordSubLabel = [[UILabel alloc] init];
+            self.coordSubLabel.font = [UIFont monospacedDigitSystemFontOfSize:11.5 weight:UIFontWeightRegular];
+            self.coordSubLabel.textColor = UIColor.secondaryLabelColor;
+            self.coordSubLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+
+            UIStackView *locTextStack = [[UIStackView alloc] initWithArrangedSubviews:@[self.addressLabel, self.coordSubLabel]];
+            locTextStack.axis = UILayoutConstraintAxisVertical;
+            locTextStack.spacing = 2;
 
             UIButton *saveMini = [UIButton buttonWithType:UIButtonTypeSystem];
-            [saveMini setImage:[UIImage systemImageNamed:@"bookmark.fill"] forState:UIControlStateNormal];
-            [saveMini setTitle:@" В закладки" forState:UIControlStateNormal];
-            saveMini.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
+            UIImageSymbolConfiguration *bcfg = [UIImageSymbolConfiguration configurationWithPointSize:16 weight:UIImageSymbolWeightSemibold];
+            [saveMini setImage:[UIImage systemImageNamed:@"bookmark.fill" withConfiguration:bcfg] forState:UIControlStateNormal];
+            saveMini.tintColor = UIColor.systemBlueColor;
+            [saveMini setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
             [saveMini addTarget:self action:@selector(quickSaveFavorite) forControlEvents:UIControlEventTouchUpInside];
+            [NSLayoutConstraint activateConstraints:@[
+              [saveMini.widthAnchor constraintEqualToConstant:34],
+              [saveMini.heightAnchor constraintEqualToConstant:34]
+            ]];
 
-            UIStackView *coordRow = [[UIStackView alloc] initWithArrangedSubviews:@[self.coordLabel, saveMini]];
-            coordRow.axis = UILayoutConstraintAxisHorizontal;
-            coordRow.alignment = UIStackViewAlignmentCenter;
-            coordRow.distribution = UIStackViewDistributionEqualSpacing;
+            UIStackView *locRow = [[UIStackView alloc] initWithArrangedSubviews:@[locTextStack, saveMini]];
+            locRow.axis = UILayoutConstraintAxisHorizontal;
+            locRow.alignment = UIStackViewAlignmentCenter;
+            locRow.spacing = 8;
 
+            // Collapsible options row (jitter + altitude)
             UILabel *jTitle = [[UILabel alloc] init];
             jTitle.text = @"Джиттер:";
             jTitle.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
@@ -2938,10 +3277,12 @@ jobs:
             [self.altButton setTitle:[NSString stringWithFormat:@"Высота: %.0fm", self.altitudeMeters] forState:UIControlStateNormal];
             [self.altButton addTarget:self action:@selector(editAltitude) forControlEvents:UIControlEventTouchUpInside];
 
-            UIStackView *optsRow = [[UIStackView alloc] initWithArrangedSubviews:@[jTitle, self.jitterControl, self.altButton]];
-            optsRow.axis = UILayoutConstraintAxisHorizontal;
-            optsRow.alignment = UIStackViewAlignmentCenter;
-            optsRow.spacing = 8;
+            self.optsRow = [[UIStackView alloc] initWithArrangedSubviews:@[jTitle, self.jitterControl, self.altButton]];
+            self.optsRow.axis = UILayoutConstraintAxisHorizontal;
+            self.optsRow.alignment = UIStackViewAlignmentCenter;
+            self.optsRow.spacing = 8;
+            self.optsRow.hidden = YES; // Start compact for maximum map screen!
+            self.sheetExpanded = NO;
 
             self.startButton = [UIButton buttonWithType:UIButtonTypeSystem];
             [self.startButton setTitle:@"Включить точку" forState:UIControlStateNormal];
@@ -2963,14 +3304,14 @@ jobs:
             btnRow.axis = UILayoutConstraintAxisHorizontal;
             btnRow.spacing = 10;
             [NSLayoutConstraint activateConstraints:@[
-              [self.startButton.heightAnchor constraintEqualToConstant:48],
-              [self.stopButton.heightAnchor constraintEqualToConstant:48],
-              [self.stopButton.widthAnchor constraintEqualToConstant:104]
+              [self.startButton.heightAnchor constraintEqualToConstant:46],
+              [self.stopButton.heightAnchor constraintEqualToConstant:46],
+              [self.stopButton.widthAnchor constraintEqualToConstant:98]
             ]];
 
-            UIStackView *mainStack = [[UIStackView alloc] initWithArrangedSubviews:@[statusRow, coordRow, optsRow, btnRow]];
+            UIStackView *mainStack = [[UIStackView alloc] initWithArrangedSubviews:@[grabberBtn, statusRow, locRow, self.optsRow, btnRow]];
             mainStack.axis = UILayoutConstraintAxisVertical;
-            mainStack.spacing = 10;
+            mainStack.spacing = 8;
             mainStack.translatesAutoresizingMaskIntoConstraints = NO;
             [card addSubview:mainStack];
 
@@ -2978,22 +3319,37 @@ jobs:
             [NSLayoutConstraint activateConstraints:@[
               [card.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
               [card.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-              [card.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-10],
+              [card.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-8],
 
-              [mainStack.topAnchor constraintEqualToAnchor:card.topAnchor constant:14],
-              [mainStack.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-14],
+              [mainStack.topAnchor constraintEqualToAnchor:card.topAnchor constant:8],
+              [mainStack.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-12],
               [mainStack.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:14],
               [mainStack.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14]
             ]];
           }
 
+          - (void)setSheetExpandedAnimated:(BOOL)expanded {
+            if (self.sheetExpanded == expanded) return;
+            self.sheetExpanded = expanded;
+            [UIView animateWithDuration:0.24 delay:0 usingSpringWithDamping:0.88 initialSpringVelocity:0.4 options:UIViewAnimationOptionAllowUserInteraction animations:^{
+              self.optsRow.hidden = !expanded;
+              [self.view layoutIfNeeded];
+            } completion:nil];
+          }
+
+          - (void)toggleSheet   { [self setSheetExpandedAnimated:!self.sheetExpanded]; }
+          - (void)expandSheet   { [self setSheetExpandedAnimated:YES]; }
+          - (void)collapseSheet { [self setSheetExpandedAnimated:NO]; }
+
           - (void)setupQuickFavoritesBar {
-            self.quickBarScroll = [[UIScrollView alloc] init];
+            self.quickBarScroll = [[GSChipScrollView alloc] init];
             self.quickBarScroll.translatesAutoresizingMaskIntoConstraints = NO;
             self.quickBarScroll.showsHorizontalScrollIndicator = NO;
             self.quickBarScroll.alwaysBounceHorizontal = YES;
+            self.quickBarScroll.canCancelContentTouches = YES;
             self.quickBarScroll.delaysContentTouches = NO;
-            self.quickBarScroll.clipsToBounds = NO;
+            self.quickBarScroll.clipsToBounds = YES;
+            self.quickBarScroll.contentInset = UIEdgeInsetsMake(0, 12, 0, 12);
             self.quickBarScroll.hidden = YES;
             [self.view addSubview:self.quickBarScroll];
 
@@ -3006,10 +3362,10 @@ jobs:
 
             UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
             [NSLayoutConstraint activateConstraints:@[
-              [self.quickBarScroll.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
-              [self.quickBarScroll.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
+              [self.quickBarScroll.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
+              [self.quickBarScroll.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
               [self.quickBarScroll.bottomAnchor constraintEqualToAnchor:self.bottomCard.topAnchor constant:-8],
-              [self.quickBarScroll.heightAnchor constraintEqualToConstant:36],
+              [self.quickBarScroll.heightAnchor constraintEqualToConstant:40],
 
               [self.quickBarStack.topAnchor constraintEqualToAnchor:self.quickBarScroll.contentLayoutGuide.topAnchor],
               [self.quickBarStack.bottomAnchor constraintEqualToAnchor:self.quickBarScroll.contentLayoutGuide.bottomAnchor],
@@ -3030,30 +3386,31 @@ jobs:
               self.quickBarScroll.hidden = YES;
               return;
             }
-            NSUInteger maxCount = MIN(saved.count, (NSUInteger)6);
+            NSUInteger maxCount = MIN(saved.count, (NSUInteger)30);
             self.quickFavorites = [saved subarrayWithRange:NSMakeRange(0, maxCount)];
             self.quickBarScroll.hidden = NO;
 
             for (NSUInteger i = 0; i < self.quickFavorites.count; i++) {
               NSDictionary *d = [self.quickFavorites[i] isKindOfClass:[NSDictionary class]] ? self.quickFavorites[i] : @{};
               NSString *name = gsStr(d[@"name"]) ?: @"Точка";
-              if (name.length > 18) name = [[name substringToIndex:17] stringByAppendingString:@"…"];
+              if (name.length > 20) name = [[name substringToIndex:19] stringByAppendingString:@"…"];
 
               UIButton *chip = [UIButton buttonWithType:UIButtonTypeSystem];
               chip.translatesAutoresizingMaskIntoConstraints = NO;
               chip.tag = (NSInteger)i;
               [chip setTitle:[NSString stringWithFormat:@"  ★ %@  ", name] forState:UIControlStateNormal];
-              chip.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
+              chip.titleLabel.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightSemibold];
               chip.titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
               chip.layer.cornerRadius = 17;
               chip.layer.shadowColor = UIColor.blackColor.CGColor;
-              chip.layer.shadowOpacity = 0.20;
+              chip.layer.shadowOpacity = 0.22;
               chip.layer.shadowRadius = 4;
               chip.layer.shadowOffset = CGSizeMake(0, 1);
+              [chip setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
               [chip addTarget:self action:@selector(quickFavoriteTapped:) forControlEvents:UIControlEventTouchUpInside];
               [NSLayoutConstraint activateConstraints:@[
                 [chip.heightAnchor constraintEqualToConstant:34],
-                [chip.widthAnchor constraintLessThanOrEqualToConstant:168]
+                [chip.widthAnchor constraintLessThanOrEqualToConstant:190]
               ]];
               [self.quickBarStack addArrangedSubview:chip];
             }
@@ -3062,18 +3419,27 @@ jobs:
 
           - (void)updateQuickBarHighlights {
             BOOL active = self.mapView.spoofActive;
+            // Highlight only the SINGLE nearest matching favorite within ~55m so nearby presets never all light up at once
+            NSInteger bestIdx = -1;
+            double bestDistSq = 0.0005 * 0.0005;
+            for (NSUInteger i = 0; i < self.quickFavorites.count; i++) {
+              NSDictionary *d = [self.quickFavorites[i] isKindOfClass:[NSDictionary class]] ? self.quickFavorites[i] : nil;
+              double lat = 0.0, lon = 0.0;
+              if (d && gsDbl(d[@"lat"], &lat) && gsDbl(d[@"lon"], &lon)) {
+                double dlat = lat - self.selectedCoord.latitude;
+                double dlon = lon - self.selectedCoord.longitude;
+                double d2 = dlat * dlat + dlon * dlon;
+                if (d2 < bestDistSq) {
+                  bestDistSq = d2;
+                  bestIdx = (NSInteger)i;
+                }
+              }
+            }
+
             for (UIView *v in self.quickBarStack.arrangedSubviews) {
               if (![v isKindOfClass:[UIButton class]]) continue;
               UIButton *chip = (UIButton *)v;
-              NSInteger idx = chip.tag;
-              BOOL isSelected = NO;
-              if (idx >= 0 && idx < (NSInteger)self.quickFavorites.count) {
-                NSDictionary *d = [self.quickFavorites[(NSUInteger)idx] isKindOfClass:[NSDictionary class]] ? self.quickFavorites[(NSUInteger)idx] : nil;
-                double lat = 0.0, lon = 0.0;
-                if (d && gsDbl(d[@"lat"], &lat) && gsDbl(d[@"lon"], &lon)) {
-                  isSelected = (fabs(lat - self.selectedCoord.latitude) < 0.0005 && fabs(lon - self.selectedCoord.longitude) < 0.0005);
-                }
-              }
+              BOOL isSelected = (chip.tag == bestIdx);
               if (isSelected && active) {
                 chip.backgroundColor = UIColor.systemGreenColor;
                 [chip setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
@@ -3097,23 +3463,106 @@ jobs:
             NSDictionary *d = [self.quickFavorites[(NSUInteger)idx] isKindOfClass:[NSDictionary class]] ? self.quickFavorites[(NSUInteger)idx] : nil;
             double lat = 0.0, lon = 0.0;
             if (!d || !gsDbl(d[@"lat"], &lat) || !gsDbl(d[@"lon"], &lon)) return;
-            double targetZ = (self.mapView.zoom >= 13.0) ? 0.0 : 15.0;
-            [self movePinTo:CLLocationCoordinate2DMake(lat, lon) centerMap:YES zoom:targetZ];
+            self.currentAddress = gsStr(d[@"name"]) ?: @"";
+            double targetZ = (self.mapView.zoom >= 13.0) ? 0.0 : 15.5;
+            [self moveCrosshairTo:CLLocationCoordinate2DMake(lat, lon) zoom:targetZ preserveAddress:(self.currentAddress.length > 0)];
             [self applySpoofTapped];
           }
 
-          - (void)movePinTo:(CLLocationCoordinate2D)coord centerMap:(BOOL)center zoom:(double)zoom {
-            self.selectedCoord = coord;
-            self.mapView.pinCoord = coord;
-            self.coordLabel.text = [NSString stringWithFormat:@"%.6f, %.6f", coord.latitude, coord.longitude];
-            if (center) {
-              [self.mapView stopAnimations];
-              self.mapView.centerLat = coord.latitude;
-              self.mapView.centerLon = coord.longitude;
-              if (zoom > 0) self.mapView.zoom = zoom;
+          - (void)updateCoordDisplay {
+            NSString *coordsStr = [NSString stringWithFormat:@"%.5f, %.5f", self.selectedCoord.latitude, self.selectedCoord.longitude];
+            NSString *metaStr = [NSString stringWithFormat:@"%@ · ±%.0fm · %.0fm", coordsStr, [self currentJitterMeters], self.altitudeMeters];
+            if (self.currentAddress.length) {
+              self.addressLabel.text = self.currentAddress;
+              self.coordSubLabel.text = metaStr;
+            } else {
+              self.addressLabel.text = [NSString stringWithFormat:@"%.6f, %.6f", self.selectedCoord.latitude, self.selectedCoord.longitude];
+              self.coordSubLabel.text = [NSString stringWithFormat:@"Джиттер: %.0fm · Высота: %.0fm  (свайп ⌃)", [self currentJitterMeters], self.altitudeMeters];
             }
+          }
+
+          - (void)moveCrosshairTo:(CLLocationCoordinate2D)coord zoom:(double)zoom preserveAddress:(BOOL)preserve {
+            self.selectedCoord = coord;
+            [self.mapView stopAnimations];
+            self.mapView.centerLat = coord.latitude;
+            self.mapView.centerLon = coord.longitude;
+            if (zoom > 0) self.mapView.zoom = zoom;
             [self.mapView reloadTiles];
+            [self updateCoordDisplay];
             [self updateQuickBarHighlights];
+            if (preserve) {
+              [self.reverseTask cancel];
+              self.reverseTask = nil;
+              self.reverseGeneration++;
+            } else {
+              [self scheduleReverseGeocodeForCoord:coord];
+            }
+          }
+
+          - (void)scheduleReverseGeocodeForCoord:(CLLocationCoordinate2D)coord {
+            [self.reverseTask cancel];
+            self.reverseTask = nil;
+            NSUInteger gen = ++self.reverseGeneration;
+
+            NSString *cacheKey = [NSString stringWithFormat:@"%.4f,%.4f", coord.latitude, coord.longitude];
+            NSString *cached = self.reverseCache[cacheKey];
+            if (cached) {
+              self.currentAddress = cached;
+              [self updateCoordDisplay];
+              return;
+            }
+
+            __weak typeof(self) weakSelf = self;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(450 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+              __strong typeof(weakSelf) self = weakSelf;
+              if (!self || gen != self.reverseGeneration) return;
+              NSString *urlStr = [NSString stringWithFormat:@"https://photon.komoot.io/reverse?lat=%.6f&lon=%.6f", coord.latitude, coord.longitude];
+              NSURL *url = [NSURL URLWithString:urlStr];
+              if (!url) return;
+              NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+              req.timeoutInterval = 8.0;
+              [req setValue:kTileUA forHTTPHeaderField:@"User-Agent"];
+              self.reverseTask = [self.mapView.session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+                (void)resp;
+                if (err && err.code == NSURLErrorCancelled) return;
+                NSString *addr = nil;
+                if (data.length && !err) {
+                  id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                  NSArray *feats = ([json isKindOfClass:[NSDictionary class]] && [((NSDictionary *)json)[@"features"] isKindOfClass:[NSArray class]])
+                           ? ((NSDictionary *)json)[@"features"] : nil;
+                  NSDictionary *f0 = (feats.count > 0 && [feats[0] isKindOfClass:[NSDictionary class]]) ? feats[0] : nil;
+                  NSDictionary *p = [f0[@"properties"] isKindOfClass:[NSDictionary class]] ? f0[@"properties"] : nil;
+                  if (p) {
+                    NSString *name = gsStr(p[@"name"]);
+                    NSString *street = gsStr(p[@"street"]);
+                    NSString *house = gsStr(p[@"housenumber"]);
+                    NSString *city = gsStr(p[@"city"]) ?: gsStr(p[@"district"]) ?: gsStr(p[@"state"]);
+                    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+                    if (name) {
+                      [parts addObject:name];
+                      if (street && ![street isEqualToString:name]) [parts addObject:street];
+                    } else if (street) {
+                      [parts addObject:(house ? [NSString stringWithFormat:@"%@ %@", street, house] : street)];
+                    }
+                    if (city && (!name || ![city isEqualToString:name])) [parts addObject:city];
+                    if (parts.count) addr = [parts componentsJoinedByString:@", "];
+                  }
+                }
+                dispatch_async(dispatch_get_main_queue(), ^{
+                  __strong typeof(weakSelf) s = weakSelf;
+                  if (!s || gen != s.reverseGeneration) return;
+                  if (addr.length) {
+                    if (s.reverseCache.count > 50) [s.reverseCache removeAllObjects];
+                    s.reverseCache[cacheKey] = addr;
+                    s.currentAddress = addr;
+                  } else {
+                    s.currentAddress = @"";
+                  }
+                  [s updateCoordDisplay];
+                });
+              }];
+              [self.reverseTask resume];
+            });
           }
 
           - (double)currentJitterMeters {
@@ -3124,28 +3573,133 @@ jobs:
             }
           }
 
-          - (void)jitterChanged { [NSUserDefaults.standardUserDefaults setInteger:self.jitterControl.selectedSegmentIndex forKey:kJitterIdxKey]; }
+          - (void)jitterChanged {
+            [NSUserDefaults.standardUserDefaults setInteger:self.jitterControl.selectedSegmentIndex forKey:kJitterIdxKey];
+            [self updateCoordDisplay];
+          }
           - (void)zoomInTapped  { self.userInteracted = YES; [self.mapView zoomBy:1.0]; }
           - (void)zoomOutTapped { self.userInteracted = YES; [self.mapView zoomBy:-1.0]; }
-          - (void)centerOnPin   { self.userInteracted = YES; [self movePinTo:self.selectedCoord centerMap:YES zoom:0]; }
+
+          - (void)centerOnActiveOrReal {
+            self.userInteracted = YES;
+            if (self.mapView.spoofActive && self.mapView.hasActiveSpoofCoord) {
+              [self.mapView glideToCoord:self.mapView.activeSpoofCoord duration:0.25];
+              return;
+            }
+            [self centerOnRealTapped];
+          }
 
           - (void)centerOnRealTapped {
             self.userInteracted = YES;
             CLLocationCoordinate2D rc;
             if (gsReadRealCoord(&rc)) {
-              [self.mapView stopAnimations];
-              self.mapView.centerLat = rc.latitude;
-              self.mapView.centerLon = rc.longitude;
-              [self.mapView reloadTiles];
+              [self.mapView glideToCoord:rc duration:0.25];
             }
           }
 
           - (void)cycleMapType {
-            self.mapView.styleIndex = (self.mapView.styleIndex + 1) % 3;
+            NSInteger cnt = [self.mapView styleCount];
+            self.mapView.styleIndex = (self.mapView.styleIndex + 1) % cnt;
             [NSUserDefaults.standardUserDefaults setInteger:self.mapView.styleIndex forKey:kMapStyleKey];
-            [self.styleBadge setTitle:[self styleTitle:self.mapView.styleIndex] forState:UIControlStateNormal];
+            [self.styleBadge setTitle:[self.mapView currentStyleTitle] forState:UIControlStateNormal];
             [self.mapView clearVisibleTiles];
             [self.mapView reloadTiles];
+          }
+
+          - (void)openMapSettings {
+            BOOL hasMT = [self.mapView hasMapTiler];
+            NSString *msg = hasMT
+              ? @"MapTiler Retina @2x HD активен (Улицы HD, Тёмная HD, Гибрид HD)."
+              : @"Бесплатный ключ MapTiler (без банковской карты на cloud.maptiler.com) включает чёткие Retina @2x карты: Улицы HD, Тёмная HD и Спутник Гибрид.";
+            UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Настройки карты" message:msg preferredStyle:UIAlertControllerStyleActionSheet];
+            [sheet addAction:[UIAlertAction actionWithTitle:(hasMT ? @"Изменить API-ключ MapTiler" : @"Ввести API-ключ MapTiler (HD)") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+              (void)a;
+              [self promptMapTilerKey];
+            }]];
+            if (hasMT) {
+              [sheet addAction:[UIAlertAction actionWithTitle:@"Отключить MapTiler (OSM/Esri)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+                (void)a;
+                [NSUserDefaults.standardUserDefaults removeObjectForKey:kMapTilerKey];
+                self.mapView.mapTilerKey = @"";
+                self.mapView.styleIndex = 0;
+                [NSUserDefaults.standardUserDefaults setInteger:0 forKey:kMapStyleKey];
+                [self.styleBadge setTitle:[self.mapView currentStyleTitle] forState:UIControlStateNormal];
+                [self.mapView clearVisibleTiles];
+                [self.mapView reloadTiles];
+                [self showToast:@"Переключено на OSM / Esri" color:UIColor.systemBlueColor];
+              }]];
+            }
+            [sheet addAction:[UIAlertAction actionWithTitle:@"Очистить кэш тайлов" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+              (void)a;
+              [self.mapView.tileCache removeAllObjects];
+              [self.mapView.session.configuration.URLCache removeAllCachedResponses];
+              [self.mapView clearVisibleTiles];
+              [self.mapView reloadTiles];
+              [self showToast:@"Кэш карты очищен" color:UIColor.systemBlueColor];
+            }]];
+            [sheet addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
+            sheet.popoverPresentationController.sourceView = self.view;
+            [self presentViewController:sheet animated:YES completion:nil];
+          }
+
+          - (void)promptMapTilerKey {
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"MapTiler API-ключ"
+                                          message:@"Вставьте ключ из cloud.maptiler.com/account/keys (мы сразу проверим его на 1 тайле)."
+                                       preferredStyle:UIAlertControllerStyleAlert];
+            [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+              tf.placeholder = @"Например: AbCdEfGh12345678";
+              tf.autocorrectionType = UITextAutocorrectionTypeNo;
+              tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+              if (self.mapView.mapTilerKey.length) tf.text = self.mapView.mapTilerKey;
+            }];
+            [ac addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
+            [ac addAction:[UIAlertAction actionWithTitle:@"Проверить и включить" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+              (void)a;
+              NSString *key = gsStr(ac.textFields.firstObject.text);
+              if (key.length < 8) {
+                [self showError:@"Ключ слишком короткий"];
+                return;
+              }
+              [self verifyAndApplyMapTilerKey:key];
+            }]];
+            [self presentViewController:ac animated:YES completion:nil];
+          }
+
+          - (void)verifyAndApplyMapTilerKey:(NSString *)key {
+            [self showToast:@"Проверяю ключ MapTiler..." color:UIColor.systemBlueColor];
+            NSString *probe = [NSString stringWithFormat:@"https://api.maptiler.com/maps/streets-v2/256/14/4825/6156@2x.png?key=%@", gsEncodeQueryValue(key)];
+            NSURL *url = [NSURL URLWithString:probe];
+            if (!url) { [self showError:@"Некорректный ключ"]; return; }
+            NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+            req.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+            req.timeoutInterval = 10.0;
+            [req setValue:kTileUA forHTTPHeaderField:@"User-Agent"];
+            __weak typeof(self) weakSelf = self;
+            NSURLSessionDataTask *t = [self.mapView.session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+              NSInteger code = [resp isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse *)resp).statusCode : 0;
+              UIImage *img = (code == 200 && data.length > 500 && !err) ? [UIImage imageWithData:data] : nil;
+              dispatch_async(dispatch_get_main_queue(), ^{
+                __strong typeof(weakSelf) self = weakSelf;
+                if (!self) return;
+                if (img) {
+                  [NSUserDefaults.standardUserDefaults setObject:key forKey:kMapTilerKey];
+                  self.mapView.mapTilerKey = key;
+                  BOOL isDark = (self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
+                  NSInteger defStyle = isDark ? 1 : 0; // Dark HD in Dark Mode, Streets HD in Light Mode
+                  self.mapView.styleIndex = defStyle;
+                  [NSUserDefaults.standardUserDefaults setInteger:defStyle forKey:kMapStyleKey];
+                  [self.styleBadge setTitle:[self.mapView currentStyleTitle] forState:UIControlStateNormal];
+                  [self.mapView clearVisibleTiles];
+                  [self.mapView reloadTiles];
+                  [[[UINotificationFeedbackGenerator alloc] init] notificationOccurred:UINotificationFeedbackTypeSuccess];
+                  [self showToast:@"✓ MapTiler HD @2x подключён!" color:UIColor.systemGreenColor];
+                } else {
+                  NSString *reason = err ? err.localizedDescription : [NSString stringWithFormat:@"HTTP %ld (проверь ключ на cloud.maptiler.com)", (long)code];
+                  [self showError:[NSString stringWithFormat:@"Ключ MapTiler не подошёл:\n%@", reason]];
+                }
+              });
+            }];
+            [t resume];
           }
 
           - (void)editAltitude {
@@ -3162,6 +3716,7 @@ jobs:
                 self.altitudeMeters = v;
                 [NSUserDefaults.standardUserDefaults setDouble:v forKey:kAltitudeKey];
                 [self.altButton setTitle:[NSString stringWithFormat:@"Высота: %.0fm", v] forState:UIControlStateNormal];
+                [self updateCoordDisplay];
               }
             }]];
             [self presentViewController:ac animated:YES completion:nil];
@@ -3180,6 +3735,12 @@ jobs:
             } else if (hasTarget || notifyActive) {
               enabled = notifyActive;
               self.cliKnownActive = notifyActive;
+              if (notifyActive && hasTarget) {
+                self.mapView.activeSpoofCoord = tc;
+                self.mapView.hasActiveSpoofCoord = YES;
+              } else if (!notifyActive) {
+                self.mapView.hasActiveSpoofCoord = NO;
+              }
             }
 
             self.mapView.spoofActive = enabled;
@@ -3233,6 +3794,8 @@ jobs:
             // Instant optimistic UI response (0ms perceived latency)
             [NSUserDefaults.standardUserDefaults setDouble:lat forKey:kLastLatKey];
             [NSUserDefaults.standardUserDefaults setDouble:lon forKey:kLastLonKey];
+            self.mapView.activeSpoofCoord = self.selectedCoord;
+            self.mapView.hasActiveSpoofCoord = YES;
             self.optimisticState = YES;
             self.optimisticUntil = CFAbsoluteTimeGetCurrent() + 4.0;
             [self refreshStatus];
@@ -3292,6 +3855,7 @@ jobs:
           - (void)stopSpoofTapped {
             [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium] impactOccurred];
             self.userInteracted = YES;
+            self.mapView.hasActiveSpoofCoord = NO;
             self.optimisticState = NO;
             self.optimisticUntil = CFAbsoluteTimeGetCurrent() + 4.0;
             [self refreshStatus];
@@ -3340,10 +3904,12 @@ jobs:
           - (void)openFavorites {
             GSFavoritesViewController *fvc = [[GSFavoritesViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
             fvc.currentCoord = self.selectedCoord;
+            fvc.suggestedName = self.currentAddress;
             __weak typeof(self) weakSelf = self;
             fvc.onPick = ^(double lat, double lon) {
               weakSelf.userInteracted = YES;
-              [weakSelf movePinTo:CLLocationCoordinate2DMake(lat, lon) centerMap:YES zoom:15.5];
+              weakSelf.currentAddress = @"";
+              [weakSelf moveCrosshairTo:CLLocationCoordinate2DMake(lat, lon) zoom:15.5 preserveAddress:NO];
             };
             fvc.onFavoritesChanged = ^{
               [weakSelf reloadQuickFavoritesBar];
@@ -3362,6 +3928,7 @@ jobs:
                                        preferredStyle:UIAlertControllerStyleAlert];
             [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
               tf.placeholder = @"Название точки";
+              if (self.currentAddress.length) tf.text = self.currentAddress;
               tf.autocapitalizationType = UITextAutocapitalizationTypeSentences;
             }];
             [ac addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
@@ -3385,7 +3952,8 @@ jobs:
             CLLocationCoordinate2D parsed;
             if (gsParseCoordinateText(clip, &parsed)) {
               self.userInteracted = YES;
-              [self movePinTo:parsed centerMap:YES zoom:15.5];
+              self.currentAddress = @"";
+              [self moveCrosshairTo:parsed zoom:15.5 preserveAddress:NO];
               [[[UINotificationFeedbackGenerator alloc] init] notificationOccurred:UINotificationFeedbackTypeSuccess];
               [self showToast:@"📋 Координаты вставлены" color:UIColor.systemBlueColor];
               return;
@@ -3403,7 +3971,8 @@ jobs:
               CLLocationCoordinate2D c;
               if (gsParseCoordinateText(ac.textFields.firstObject.text ?: @"", &c)) {
                 self.userInteracted = YES;
-                [self movePinTo:c centerMap:YES zoom:15.5];
+                self.currentAddress = @"";
+                [self moveCrosshairTo:c zoom:15.5 preserveAddress:NO];
               } else {
                 [self showError:@"Не удалось распознать координаты"];
               }
@@ -3522,8 +4091,9 @@ jobs:
             CLLocationCoordinate2D direct;
             if (gsParseCoordinateText(q, &direct)) {
               self.userInteracted = YES;
+              self.currentAddress = @"";
               self.resultsTable.hidden = YES;
-              [self movePinTo:direct centerMap:YES zoom:15.5];
+              [self moveCrosshairTo:direct zoom:15.5 preserveAddress:NO];
               return;
             }
             NSArray<NSDictionary *> *cached = [self cachedResultsForQuery:q];
@@ -3678,10 +4248,12 @@ jobs:
             self.userInteracted = YES;
             [self cancelPendingSearch];
             [self recordRecentPlace:d];
-            self.searchBar.text = gsStr(d[@"name"]) ?: @"";
+            NSString *picked = gsStr(d[@"name"]) ?: @"";
+            self.searchBar.text = picked;
+            self.currentAddress = picked;
             self.resultsTable.hidden = YES;
             [self.searchBar resignFirstResponder];
-            [self movePinTo:CLLocationCoordinate2DMake(lat, lon) centerMap:YES zoom:15.5];
+            [self moveCrosshairTo:CLLocationCoordinate2DMake(lat, lon) zoom:15.5 preserveAddress:(picked.length > 0)];
           }
 
           @end
@@ -3770,7 +4342,10 @@ jobs:
           assert "regulad.geoshim.reload" in open("app/MapViewController.m").read()
           assert "GSDisplayLinkProxy" in open("app/MapViewController.m").read()
           assert "pinchEndedTs" in open("app/MapViewController.m").read()
-          assert "GeoShimApp/1.3.1" in open("app/MapViewController.m").read()
+          assert "GeoShimApp/1.4" in open("app/MapViewController.m").read()
+          assert "GSChipScrollView" in open("app/MapViewController.m").read()
+          assert "touchesShouldCancelInContentView" in open("app/MapViewController.m").read()
+          assert "api.maptiler.com" in open("app/MapViewController.m").read()
           assert "tile.openstreetmap.org" in open("app/MapViewController.m").read()
           assert "cartocdn" not in open("app/MapViewController.m").read()
           print("patch ok")
@@ -3786,7 +4361,7 @@ jobs:
           tar -xf /tmp/sdk.tar.xz -C "$HOME/theos/sdks"
           ls "$HOME/theos/sdks"
 
-      - name: Build .deb (release v1.3.1 + GeoShimApp v1.3.1)
+      - name: Build .deb (release v1.3.1 + GeoShimApp v1.4)
         run: |
           export THEOS="$HOME/theos"
           make package FINALPACKAGE=1 ARCHS=arm64e
@@ -3821,8 +4396,9 @@ jobs:
           strings /tmp/debx/Library/MobileSubstrate/DynamicLibraries/GeoShim.dylib | grep -q "regulad.geoshim.reload" || { echo "reload notify missing in dylib"; exit 1; }
           strings /tmp/debx/usr/local/bin/geoshim | grep -q "dmach_in=" || { echo "xpc release output missing in cli"; exit 1; }
           strings /tmp/debx/Applications/GeoShimApp.app/GeoShimApp | grep -q "tile.openstreetmap.org" || { echo "OSM tile engine missing in app"; exit 1; }
-          strings /tmp/debx/Applications/GeoShimApp.app/GeoShimApp | grep -q "GeoShimApp/1.3.1" || { echo "v1.3.1 UA missing in app"; exit 1; }
-          python3 -c 'import plistlib; p=plistlib.load(open("/tmp/debx/Applications/GeoShimApp.app/Info.plist","rb")); assert p.get("CFBundleShortVersionString")=="1.3.1" and p.get("CFBundleVersion")=="5", p; print("Info.plist ok:", p["CFBundleShortVersionString"], "build", p["CFBundleVersion"])'
+          strings /tmp/debx/Applications/GeoShimApp.app/GeoShimApp | grep -q "GeoShimApp/1.4" || { echo "v1.4 UA missing in app"; exit 1; }
+          strings /tmp/debx/Applications/GeoShimApp.app/GeoShimApp | grep -q "api.maptiler.com" || { echo "MapTiler HD support missing in app"; exit 1; }
+          python3 -c 'import plistlib; p=plistlib.load(open("/tmp/debx/Applications/GeoShimApp.app/Info.plist","rb")); assert p.get("CFBundleShortVersionString")=="1.4" and p.get("CFBundleVersion")=="6", p; print("Info.plist ok:", p["CFBundleShortVersionString"], "build", p["CFBundleVersion"])'
           [ -f /tmp/debx/Applications/GeoShimApp.app/AppIcon60x60@3x.png ] || { echo "AppIcon missing"; exit 1; }
           ldid -e /tmp/debx/Applications/GeoShimApp.app/GeoShimApp | grep -q "no-sandbox" || { echo "entitlements missing on GeoShimApp"; exit 1; }
           dpkg-deb -I "$DEB" postinst | grep -q "uicache" || { echo "postinst uicache missing"; exit 1; }
